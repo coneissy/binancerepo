@@ -38,7 +38,7 @@ MAX_TRADES_PER_DAY=10
 COOLDOWN_SECONDS=300
 ```
 
-Never commit API keys. Use GitHub Actions secrets or hosting-provider environment variables. Binance's official API documentation is authoritative for endpoints, authentication, rate limits and supported non-production environments. citeturn0search0turn0search3
+Never commit API keys. Use GitHub Actions secrets or hosting-provider environment variables. Binance's official API documentation is authoritative for endpoints, authentication, rate limits and supported non-production environments.
 
 ## Run locally
 ```bash
@@ -55,6 +55,6 @@ CI validates Python syntax and runs the test suite. CI never receives trading cr
 ## Next hardening step before live trading
 1. Reconcile realized PnL from Binance instead of relying only on local state.
 2. Reconcile orders/positions after restarts.
-3. Add WebSocket user-data reconciliation; Binance recommends user-data streams for timely order and position updates, and streams require keepalive/reconnection handling. citeturn0search0turn0search3
+3. Add WebSocket user-data reconciliation for timely order and position updates, including keepalive and reconnection handling.
 4. Add Telegram `/status`, `/pause`, `/resume`, and a hard live-trading kill switch.
 5. Run extended demo/dry-run tests before any live API key is permitted.
