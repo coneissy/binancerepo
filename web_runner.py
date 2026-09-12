@@ -2,7 +2,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import bot
+import hft_scalper
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -11,7 +11,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        payload = b'{"status":"ok","service":"binance-futures-scalper"}'
+        payload = b'{"status":"ok","service":"binance-hft-scalper","dry_run":true}'
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
@@ -24,7 +24,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.getenv('PORT', '10000'))
-    worker = threading.Thread(target=bot.main, name='scalper', daemon=True)
+    worker = threading.Thread(target=hft_scalper.main, name='hft-scalper', daemon=True)
     worker.start()
     server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
     print(f'Health server listening on :{port}', flush=True)
