@@ -1,9 +1,15 @@
+"""Event-driven, dry-run-first Binance USD-M Futures scalper.
+
+This is HFT-inspired, not exchange-colocated HFT. Market data is WebSocket-first;
+REST is used only during startup to build the liquid universe.
+"""
 import json
 import logging
+import math
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 
 import requests
 import websocket
@@ -12,46 +18,38 @@ BASE = os.getenv("BINANCE_BASE_URL", "https://demo-fapi.binance.com")
 WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "100"))
+WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
 ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.80"))
 MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0025"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0015"))
-MAX_HOLD_SECONDS = float(os.getenv("MAX_HOLD_SECONDS", "45"))
-MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
+TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0025"))
+SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0015"))
+MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "45"))
+MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "8"))
+COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "3"))
+STATE_LEN = int(os.getenv("STATE_LEN", "240"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hft-scalper")
-S = requests.Session()
+http = requests.Session()
 
-prices = defaultdict(lambda: deque(maxlen=180))
-trades = defaultdict(lambda: deque(maxlen=180))
+# symbol -> compact rolling state
+state = {}
 positions = {}
+last_entry = {}
 lock = threading.RLock()
+metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0}
 
 
 def public(path, params=None):
-    r = S.get(BASE + path, params=params, timeout=10)
+    r = http.get(BASE + path, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
 
 
-def ema(xs, n):
-    k = 2.0 / (n + 1.0)
-    e = xs[0]
-    for x in xs[1:]:
-        e = x * k + e * (1.0 - k)
-    return e
-
-
-def rsi(xs, n=14):
-    if len(xs) <= n:
-        return 50.0
-    d = [xs[i] - xs[i - 1] for i in range(1, len(xs))][-n:]
-    g = sum(max(x, 0.0) for x in d) / n
-    l = sum(max(-x, 0.0) for x in d) / n
-    if l == 0:
-        return 100.0
-    return 100.0 - 100.0 / (1.0 + g / l)
+def make_state():
+    return {"bid": 0.0, "ask": 0.0, "bq": 0.0, "aq": 0.0, "last": 0.0,
+            "prices": deque(maxlen=STATE_LEN), "flow": deque(maxlen=STATE_LEN), "last_event": 0.0}
 
 
 def universe():
@@ -68,138 +66,181 @@ def universe():
         try:
             qv = float(t.get("quoteVolume", 0))
             move = abs(float(t.get("priceChangePercent", 0))) / 100.0
-            if qv >= MIN_24H_QUOTE_VOLUME:
+            if qv >= MIN_QV:
                 ranked.append((qv * max(move, 0.002), s))
         except (TypeError, ValueError):
-            pass
+            continue
     ranked.sort(reverse=True)
     return [s for _, s in ranked[:UNIVERSE_SIZE]]
 
 
-def make_stream(symbols):
+def stream_url(symbols):
     streams = []
     for s in symbols:
-        # aggTrade gives every aggregated trade update with very low processing overhead.
+        streams.append(f"{s}@bookTicker")
         streams.append(f"{s}@aggTrade")
     return WS_BASE + "?streams=" + "/".join(streams)
 
 
-def signal(symbol):
-    with lock:
-        xs = list(prices[symbol])
-        ts = list(trades[symbol])
-    if len(xs) < 30:
+def score_symbol(s):
+    """Microstructure score. Returns (side, score, fill_price) or None."""
+    st = state.get(s)
+    if not st or st["bid"] <= 0 or st["ask"] <= 0:
         return None
-    last = xs[-1]
-    e5, e9, e21 = ema(xs, 5), ema(xs, 9), ema(xs, 21)
-    rr = rsi(xs)
-    mom = last / xs[-4] - 1.0
-    recent = ts[-20:]
-    if len(recent) < 10:
+    mid = (st["bid"] + st["ask"]) * 0.5
+    spread_bps = (st["ask"] - st["bid"]) / mid * 10000.0
+    if spread_bps > MAX_SPREAD_BPS:
         return None
-    baseline = sum(ts[:-20]) / max(len(ts[:-20]), 1) if len(ts) > 20 else sum(recent) / len(recent)
-    flow = (sum(recent) / len(recent)) / max(baseline, 1e-9)
+    ps = st["prices"]
+    fs = st["flow"]
+    if len(ps) < 20 or len(fs) < 10:
+        return None
+    imbalance = (st["bq"] - st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
+    micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
+    micro_edge = (micro - mid) / mid
+    momentum = ps[-1] / ps[-8] - 1.0
+    recent_flow = sum(fs[-8:])
+    base_flow = sum(abs(x) for x in fs[-40:-8]) / max(len(fs[-40:-8]), 1)
+    flow_edge = recent_flow / max(base_flow, 1e-12)
+    vol = max(ps[-1] / min(ps) - 1.0, 0.0) if len(ps) >= 20 else 0.0
 
     long_score = 0.0
     short_score = 0.0
-    if e5 > e9 > e21 and last > e5:
-        long_score += 0.35
-    if e5 < e9 < e21 and last < e5:
-        short_score += 0.35
-    if rr >= 55:
-        long_score += 0.20
-    if rr <= 45:
-        short_score += 0.20
-    if mom >= 0.0008:
-        long_score += 0.20
-    if mom <= -0.0008:
-        short_score += 0.20
-    if flow >= 1.20:
-        if mom > 0:
-            long_score += 0.15
-        elif mom < 0:
-            short_score += 0.15
+    long_score += min(max(imbalance, 0.0), 1.0) * 0.35
+    short_score += min(max(-imbalance, 0.0), 1.0) * 0.35
+    long_score += min(max(micro_edge / 0.0005, 0.0), 1.0) * 0.20
+    short_score += min(max(-micro_edge / 0.0005, 0.0), 1.0) * 0.20
+    long_score += min(max(momentum / 0.0015, 0.0), 1.0) * 0.25
+    short_score += min(max(-momentum / 0.0015, 0.0), 1.0) * 0.25
+    long_score += min(max(flow_edge / 2.0, 0.0), 1.0) * 0.20 if recent_flow > 0 else 0.0
+    short_score += min(max(flow_edge / 2.0, 0.0), 1.0) * 0.20 if recent_flow < 0 else 0.0
+    # Avoid dead markets; require some movement without chasing extreme spreads.
+    if vol < 0.0002:
+        return None
     score = max(long_score, short_score)
     if score < ENTRY_SCORE:
         return None
-    return ("BUY" if long_score > short_score else "SELL", score, last)
+    side = "BUY" if long_score > short_score else "SELL"
+    return side, score, st["ask"] if side == "BUY" else st["bid"]
 
 
-def paper_entry(symbol, side, score, price):
+def enter(s, side, score, price):
+    now = time.time()
     with lock:
-        if symbol in positions or len(positions) >= MAX_POSITIONS:
+        if s in positions or len(positions) >= MAX_POSITIONS:
             return
-        positions[symbol] = {"side": side, "entry": price, "opened": time.time(), "score": score}
-    log.warning("ENTRY %s %s score=%.2f price=%s%s", side, symbol.upper(), score, price,
-                " [DRY RUN]" if DRY_RUN else "")
+        if now - last_entry.get(s, 0.0) < COOLDOWN:
+            return
+        positions[s] = {"side": side, "entry": price, "opened": now, "score": score}
+        last_entry[s] = now
+        metrics["entries"] += 1
+    log.warning("ENTRY %s %s score=%.3f price=%.10g [DRY RUN]", side, s.upper(), score, price)
 
 
 def manage_positions():
     now = time.time()
     exits = []
     with lock:
-        snapshot = list(positions.items())
-        for symbol, p in snapshot:
-            px = prices[symbol][-1] if prices[symbol] else p["entry"]
-            ret = (px / p["entry"] - 1.0) if p["side"] == "BUY" else (p["entry"] / px - 1.0)
+        for s, p in list(positions.items()):
+            st = state.get(s)
+            if not st:
+                continue
+            px = st["bid"] if p["side"] == "BUY" else st["ask"]
+            if px <= 0:
+                continue
+            ret = px / p["entry"] - 1.0 if p["side"] == "BUY" else p["entry"] / px - 1.0
             reason = None
-            if ret >= TAKE_PROFIT_PCT:
+            if ret >= TP_PCT:
                 reason = "TP"
-            elif ret <= -STOP_LOSS_PCT:
+            elif ret <= -SL_PCT:
                 reason = "SL"
-            elif now - p["opened"] >= MAX_HOLD_SECONDS:
+            elif now - p["opened"] >= MAX_HOLD:
                 reason = "TIME"
+            else:
+                sig = score_symbol(s)
+                if sig and sig[0] != p["side"] and sig[1] >= ENTRY_SCORE:
+                    reason = "REVERSAL"
             if reason:
-                exits.append((symbol, p, px, ret, reason))
-                positions.pop(symbol, None)
-    for symbol, p, px, ret, reason in exits:
-        log.warning("EXIT %s %s entry=%s exit=%s return=%.4f%% held=%.1fs",
-                    reason, symbol.upper(), p["entry"], px, ret * 100, now - p["opened"])
+                positions.pop(s, None)
+                metrics["exits"] += 1
+                exits.append((s, p, px, ret, reason, now - p["opened"]))
+    for s, p, px, ret, reason, held in exits:
+        log.warning("EXIT %s %s entry=%.10g exit=%.10g return=%.3f%% held=%.2fs", reason, s.upper(), p["entry"], px, ret * 100, held)
 
 
 def on_message(_, raw):
     try:
         msg = json.loads(raw)
         d = msg.get("data", msg)
-        symbol = d.get("s", "").lower()
-        price = float(d["p"])
-        qty = float(d.get("q", 0))
-        if not symbol:
+        event = d.get("e")
+        s = d.get("s", "").lower()
+        if not s:
             return
-        with lock:
-            prices[symbol].append(price)
-            trades[symbol].append(qty * price)
-        sig = signal(symbol)
+        st = state.get(s)
+        if st is None:
+            return
+        metrics["events"] += 1
+        if event == "bookTicker":
+            st["bid"] = float(d["b"])
+            st["ask"] = float(d["a"])
+            st["bq"] = float(d["B"])
+            st["aq"] = float(d["A"])
+            st["last_event"] = time.time()
+        elif event == "aggTrade":
+            px = float(d["p"])
+            qty = float(d["q"])
+            signed = -px * qty if d.get("m") else px * qty
+            st["last"] = px
+            st["prices"].append(px)
+            st["flow"].append(signed)
+            st["last_event"] = time.time()
+        else:
+            return
+        sig = score_symbol(s)
         if sig:
-            side, score, px = sig
-            paper_entry(symbol, side, score, px)
+            metrics["signals"] += 1
+            enter(s, *sig)
     except Exception:
-        log.exception("websocket message error")
+        log.exception("market-data message error")
 
 
-def run_ws(url):
+def run_ws(url, shard):
     while True:
         try:
-            log.info("Connecting market-data websocket for 100-symbol universe")
+            log.info("WS shard %d connecting", shard)
             ws = websocket.WebSocketApp(url, on_message=on_message,
-                                        on_error=lambda _, e: log.warning("WS error: %s", e),
-                                        on_close=lambda _, c, m: log.warning("WS closed: %s %s", c, m))
+                                        on_error=lambda _, e: log.warning("WS shard %d error: %s", shard, e),
+                                        on_close=lambda _, c, m: log.warning("WS shard %d closed: %s %s", shard, c, m))
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception:
-            log.exception("WS connection failed")
+            log.exception("WS shard %d failed", shard)
+        metrics["reconnects"] += 1
         time.sleep(2)
+
+
+def monitor():
+    while True:
+        manage_positions()
+        time.sleep(0.02)
 
 
 def main():
     if not DRY_RUN:
-        raise RuntimeError("Live execution is intentionally not enabled by this engine yet; keep DRY_RUN=true while validating signals.")
+        raise RuntimeError("Live execution is disabled in this engine. Keep DRY_RUN=true until paper results are validated.")
     symbols = universe()
-    log.warning("HFT-STYLE ENGINE STARTED: %d symbols, dry_run=%s", len(symbols), DRY_RUN)
-    url = make_stream(symbols)
-    threading.Thread(target=run_ws, args=(url,), daemon=True).start()
+    for s in symbols:
+        state[s] = make_state()
+    shards = [[] for _ in range(min(WS_SHARDS, max(1, len(symbols))))]
+    for i, s in enumerate(symbols):
+        shards[i % len(shards)].append(s)
+    log.warning("ENGINE STARTED | symbols=%d shards=%d dry_run=%s", len(symbols), len(shards), DRY_RUN)
+    for i, shard_symbols in enumerate(shards, 1):
+        threading.Thread(target=run_ws, args=(stream_url(shard_symbols), i), daemon=True).start()
+    threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
     while True:
-        manage_positions()
-        time.sleep(0.05)
+        time.sleep(10)
+        log.info("metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d",
+                 metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], metrics["reconnects"], len(positions))
 
 
 if __name__ == "__main__":
