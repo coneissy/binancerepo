@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python web_runner.py
+    startCommand: python -m multi_coin_scalper
     healthCheckPath: /healthz
     envVars:
       - key: BINANCE_API_KEY
@@ -15,27 +15,27 @@ services:
         value: https://demo-fapi.binance.com
       - key: BINANCE_WS_BASE_URL
         value: wss://fstream.binance.com/ws
-      - key: BINANCE_SYMBOL
-        value: BTCUSDT
-      - key: BINANCE_INTERVAL
-        value: 1m
-      - key: BINANCE_LEVERAGE
+      - key: SCAN_SIZE
+        value: "100"
+      - key: SCAN_SECONDS
+        value: "5"
+      - key: MAX_SIMULTANEOUS_POSITIONS
         value: "3"
-      - key: RISK_PER_TRADE
-        value: "0.0025"
-      - key: MAX_DAILY_LOSS
-        value: "0.01"
-      - key: MAX_TRADES_PER_DAY
-        value: "10"
-      - key: COOLDOWN_SECONDS
-        value: "300"
-      - key: LOOP_SECONDS
-        value: "30"
+      - key: MIN_24H_QUOTE_VOLUME
+        value: "5000000"
+      - key: MIN_ATR_PCT
+        value: "0.0015"
+      - key: MAX_ATR_PCT
+        value: "0.08"
+      - key: MIN_SIGNAL_SCORE
+        value: "0.80"
+      - key: TP_ATR
+        value: "0.65"
+      - key: SL_ATR
+        value: "1.00"
       - key: DRY_RUN
         value: "true"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: RISK_STATE_FILE
-        value: risk_state.json
