@@ -1,12 +1,13 @@
 """Fast microstructure layer for Cryptoalpha.
 
 Keeps the strongest part of the old fast scalper: sub-minute reaction speed.
-It does not execute orders; it only adds a 30-second confirmation gate/boost
-on top of the 1m adaptive engine while DRY_RUN remains mandatory.
+Adds Buildix orderflow + smart-money intelligence underneath the 30s gate.
+It does not execute orders; DRY_RUN remains mandatory.
 """
 import os
 import time
 from collections import defaultdict, deque
+import buildix_flow
 
 ENGINE = None
 _ORIGINAL_MESSAGE = None
@@ -48,8 +49,6 @@ def _micro(s):
 
 
 def on_message(ws, msg):
-    # Feed the original websocket handler first so the engine's normal 1m
-    # state remains authoritative.
     _ORIGINAL_MESSAGE(ws, msg)
     try:
         import json
@@ -90,9 +89,6 @@ def score(s, radar, age, q, reject):
         base["ensemble_score"] = max(0.0, float(base.get("ensemble_score", base["score"])) - PENALTY)
         STATS["penalties"] += 1
 
-    # Fast tape confirmation can upgrade a borderline 1m setup, but never
-    # creates a trade from nothing: the underlying engine must already be
-    # eligible and the micro tape must agree with the intended side.
     base["micro"] = {"trades": m["trades"], "flow": round(m["flow"], 4), "mom": round(m["mom"], 6), "velocity": round(m["velocity"], 8)}
     base["micro_confirmed"] = micro_ok
     base["eligible"] = bool(base.get("eligible") and micro_ok and base["score"] >= ENGINE.ENTRY)
@@ -104,6 +100,8 @@ def score(s, radar, age, q, reject):
 def install(engine):
     global ENGINE, _ORIGINAL_MESSAGE, _ORIGINAL_SCORE
     ENGINE = engine
+    # Buildix sits between the adaptive 1m layer and the fast 30s confirmation.
+    buildix_flow.install(engine)
     _ORIGINAL_MESSAGE = engine.on_message
     _ORIGINAL_SCORE = engine.score
     engine.on_message = on_message
@@ -112,4 +110,4 @@ def install(engine):
 
 
 def stats():
-    return {**STATS, "window_seconds": WINDOW, "flow_gate": FLOW_GATE, "mom_gate": MOM_GATE}
+    return {**STATS, "window_seconds": WINDOW, "flow_gate": FLOW_GATE, "mom_gate": MOM_GATE, "buildix": buildix_flow.stats()}
