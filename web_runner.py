@@ -2,7 +2,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import run_10s
+import hft_scalper_30s
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -11,7 +11,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        payload = b'{"status":"ok","service":"binance-10s-scalper","dry_run":true}'
+        payload = b'{"status":"ok","service":"binance-30s-engine","dry_run":true}'
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
@@ -24,7 +24,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.getenv('PORT', '10000'))
-    worker = threading.Thread(target=run_10s.main, name='scalp-10s', daemon=True)
+    worker = threading.Thread(target=hft_scalper_30s.main, name='scalp-30s', daemon=True)
     worker.start()
     server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
     print(f'Health server listening on :{port}', flush=True)
