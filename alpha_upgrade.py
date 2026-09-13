@@ -1,9 +1,9 @@
 """Adaptive upgrade layer for the ALPHA 1M paper engine.
 
 Adds a small strategy ensemble, regime-aware adaptive weights, trailing exits,
-and richer stats without enabling live execution.
+and complete paper-trading performance accounting without enabling live execution.
 """
-import os, time, math
+import os
 from collections import defaultdict
 
 ENGINE = None
@@ -50,10 +50,7 @@ def adaptive_score(s, radar, age, q, reject):
     ret = f["ret"]
     ret5 = f["ret5"]
     accel = f["accel"]
-    atr = max(f["atr"], .0001)
 
-    # Four deliberately different hypotheses. They are blended rather than
-    # requiring every indicator to agree, reducing single-signal brittleness.
     momentum = _clamp(.35 * _clamp(abs(ret5) / .008) + .35 * _clamp(abs(accel) / .0025) + .30 * _clamp(z / 2.5))
     breakout = _clamp(.45 * (1.0 if f["break"] else 0.0) + .30 * _clamp((rv - 1) / 1.5) + .25 * _clamp(abs(ret) / .004))
     flow = _clamp(.55 * ((sf + 1) / 2) + .25 * ((sb + 1) / 2) + .20 * _clamp((rv - 1) / 1.5))
@@ -65,9 +62,8 @@ def adaptive_score(s, radar, age, q, reject):
     total_w = sum(w.values()) or 1.0
     ensemble = sum(weighted.values()) / total_w
 
-    # Base score remains the safety anchor. Ensemble can move it, but only
-    # within a bounded band, preventing the overlay from turning into a
-    # completely different unvalidated strategy.
+    # Keep the validated base engine as the hard eligibility anchor. The
+    # ensemble can improve ranking, but cannot create a trade by itself.
     final_score = _clamp(.68 * base["score"] + .32 * ensemble)
     threshold = ENGINE.ENTRY
     final_eligible = bool(base["eligible"] and final_score >= threshold)
@@ -78,7 +74,7 @@ def adaptive_score(s, radar, age, q, reject):
         "strategy_scores": raw,
         "strategy_weights": w,
         "eligible": final_eligible,
-        "trail_arm": max(TRAIL_ARM, atr * TRAIL_ATR_MULT),
+        "trail_arm": max(TRAIL_ARM, f["atr"] * TRAIL_ATR_MULT),
         "trail_gap": TRAIL_GAP,
     })
     return base
@@ -95,8 +91,7 @@ def _record(strategy, regime, net):
 
 def adaptive_manage():
     """Paper position manager with hard stop, target, time stop and trailing."""
-    global ENGINE
-    now = time.time()
+    now = __import__("time").time()
     for s, p in list(ENGINE.positions.items()):
         z = ENGINE.st(s)
         px = z["bid"] if p["side"] == "BUY" else z["ask"]
@@ -130,20 +125,28 @@ def adaptive_manage():
         ENGINE.equity += cash_pnl
         ENGINE.peak_equity = max(ENGINE.peak_equity, ENGINE.equity)
         dd = max(0.0, (ENGINE.peak_equity - ENGINE.equity) / max(ENGINE.peak_equity, 1e-9))
-        ENGINE.metrics["pnl"] += cash_pnl
-        ENGINE.metrics["equity"] = ENGINE.equity
-        ENGINE.metrics["peak_equity"] = ENGINE.peak_equity
-        ENGINE.metrics["drawdown"] = dd
-        ENGINE.metrics["exits"] += 1
+
+        m = ENGINE.metrics
+        m["pnl"] = float(m.get("pnl", 0.0)) + cash_pnl
+        m["net_pnl"] = float(m.get("net_pnl", 0.0)) + net
         if cash_pnl >= 0:
-            ENGINE.metrics["wins"] += 1
+            m["gross_profit"] = float(m.get("gross_profit", 0.0)) + cash_pnl
         else:
-            ENGINE.metrics["losses"] += 1
+            m["gross_loss"] = float(m.get("gross_loss", 0.0)) + abs(cash_pnl)
+        m["equity"] = ENGINE.equity
+        m["peak_equity"] = ENGINE.peak_equity
+        m["drawdown"] = dd
+        m["exits"] = int(m.get("exits", 0)) + 1
+        m["adaptive_exits"] = int(m.get("adaptive_exits", 0)) + 1
+        if cash_pnl >= 0:
+            m["wins"] = int(m.get("wins", 0)) + 1
+        else:
+            m["losses"] = int(m.get("losses", 0)) + 1
         _record(p.get("strategy", "MOMENTUM"), ENGINE.regime, net)
         ENGINE.positions.pop(s, None)
         if dd >= ENGINE.MAX_DRAWDOWN and not ENGINE.trading_halted:
             ENGINE.trading_halted = True
-            ENGINE.metrics["trading_halted"] = True
+            m["trading_halted"] = True
         ENGINE.log.warning(
             "ALPHA EXIT %s %s strategy=%s ret=%.3f%% net=%.3f%% pnl=%.2f dd=%.2f%%",
             reason, s.upper(), p.get("strategy", "MOMENTUM"), ret * 100, net * 100, cash_pnl, dd * 100
@@ -160,8 +163,13 @@ def install(engine):
     engine.metrics.setdefault("adaptive_exits", 0)
     engine.metrics.setdefault("gross_profit", 0.0)
     engine.metrics.setdefault("gross_loss", 0.0)
+    engine.metrics.setdefault("net_pnl", 0.0)
     return engine
 
 
 def stats():
-    return {"strategies": PERF, "trail_arm_pct": TRAIL_ARM, "trail_gap_pct": TRAIL_GAP, "trail_atr_mult": TRAIL_ATR_MULT}
+    return {
+        "strategies": PERF,
+        "trailing": {"arm_pct": TRAIL_ARM, "gap_pct": TRAIL_GAP, "atr_mult": TRAIL_ATR_MULT},
+        "adaptive_exits": int(ENGINE.metrics.get("adaptive_exits", 0)) if ENGINE else 0,
+    }
