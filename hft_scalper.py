@@ -19,7 +19,7 @@ WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "100"))
 WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
-ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.80"))
+ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.60"))
 MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
 TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0025"))
 SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0015"))
@@ -33,12 +33,13 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 log = logging.getLogger("hft-scalper")
 http = requests.Session()
 
-# symbol -> compact rolling state
 state = {}
 positions = {}
 last_entry = {}
 lock = threading.RLock()
-metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0}
+metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0,
+           "no_book": 0, "short_state": 0, "spread_reject": 0, "vol_reject": 0,
+           "score_reject": 0, "long_candidates": 0, "short_candidates": 0}
 
 
 def public(path, params=None):
@@ -86,14 +87,17 @@ def score_symbol(s):
     """Microstructure score. Returns (side, score, fill_price) or None."""
     st = state.get(s)
     if not st or st["bid"] <= 0 or st["ask"] <= 0:
+        metrics["no_book"] += 1
         return None
     mid = (st["bid"] + st["ask"]) * 0.5
     spread_bps = (st["ask"] - st["bid"]) / mid * 10000.0
     if spread_bps > MAX_SPREAD_BPS:
+        metrics["spread_reject"] += 1
         return None
     ps = st["prices"]
     fs = st["flow"]
     if len(ps) < 20 or len(fs) < 10:
+        metrics["short_state"] += 1
         return None
     imbalance = (st["bq"] - st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
@@ -102,7 +106,9 @@ def score_symbol(s):
     recent_flow = sum(fs[-8:])
     base_flow = sum(abs(x) for x in fs[-40:-8]) / max(len(fs[-40:-8]), 1)
     flow_edge = recent_flow / max(base_flow, 1e-12)
-    vol = max(ps[-1] / min(ps) - 1.0, 0.0) if len(ps) >= 20 else 0.0
+    # Direction-neutral realized volatility over the recent trade-price window.
+    returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 20), len(ps)) if ps[i - 1] > 0]
+    vol = math.sqrt(sum(r * r for r in returns) / max(len(returns), 1))
 
     long_score = 0.0
     short_score = 0.0
@@ -112,13 +118,22 @@ def score_symbol(s):
     short_score += min(max(-micro_edge / 0.0005, 0.0), 1.0) * 0.20
     long_score += min(max(momentum / 0.0015, 0.0), 1.0) * 0.25
     short_score += min(max(-momentum / 0.0015, 0.0), 1.0) * 0.25
-    long_score += min(max(flow_edge / 2.0, 0.0), 1.0) * 0.20 if recent_flow > 0 else 0.0
-    short_score += min(max(flow_edge / 2.0, 0.0), 1.0) * 0.20 if recent_flow < 0 else 0.0
-    # Avoid dead markets; require some movement without chasing extreme spreads.
+    # Use the absolute directional flow strength for the matching side.
+    long_flow = max(flow_edge, 0.0)
+    short_flow = max(-flow_edge, 0.0)
+    long_score += min(long_flow / 2.0, 1.0) * 0.20
+    short_score += min(short_flow / 2.0, 1.0) * 0.20
+
     if vol < 0.0002:
+        metrics["vol_reject"] += 1
         return None
     score = max(long_score, short_score)
     if score < ENTRY_SCORE:
+        metrics["score_reject"] += 1
+        if long_score >= short_score:
+            metrics["long_candidates"] += 1
+        else:
+            metrics["short_candidates"] += 1
         return None
     side = "BUY" if long_score > short_score else "SELL"
     return side, score, st["ask"] if side == "BUY" else st["bid"]
@@ -239,8 +254,10 @@ def main():
     threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
     while True:
         time.sleep(10)
-        log.info("metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d",
-                 metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], metrics["reconnects"], len(positions))
+        log.info("metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d rejections={book:%d state:%d spread:%d vol:%d score:%d candidates:L%d/S%d}",
+                 metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], metrics["reconnects"], len(positions),
+                 metrics["no_book"], metrics["short_state"], metrics["spread_reject"], metrics["vol_reject"], metrics["score_reject"],
+                 metrics["long_candidates"], metrics["short_candidates"])
 
 
 if __name__ == "__main__":
