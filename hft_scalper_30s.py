@@ -1,8 +1,7 @@
 """1m meme momentum engine. PAPER/DRY-RUN ONLY.
 
-Designed for fast operation: REST seeds closed 1m/5m candles, websocket keeps
-live trade/book state, scoring is exception-safe, and diagnostics identify the
-exact rejection stage. It never enables live execution.
+Dynamic meme-oriented universe, 1m-first ranking, 5m confirmation and
+breadth regime filtering. Live execution is permanently disabled.
 """
 import json, logging, math, os, threading, time
 from collections import deque
@@ -12,14 +11,14 @@ import requests, websocket
 BASE=os.getenv("BINANCE_BASE_URL","https://demo-fapi.binance.com")
 WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
 DRY_RUN=os.getenv("DRY_RUN","true").lower()=="true"
-DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","30")))
+DISCOVERY_N=max(50,int(os.getenv("DISCOVERY_N","50")))
 EXECUTION_N=max(10,int(os.getenv("EXECUTION_N","10")))
 REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","30"))
 MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","300000"))
-MIN1=float(os.getenv("MIN_1M_QUOTE_VOLUME","5000"))
+MIN1=float(os.getenv("MIN_1M_QUOTE_VOLUME","4500"))
 ENTRY=float(os.getenv("ENTRY_SCORE","0.60"))
 EDGE=float(os.getenv("MIN_EDGE_BPS","9"))
-FLOW_MIN=float(os.getenv("MIN_FLOW_SCORE","0.51"))
+FLOW_MIN=float(os.getenv("MIN_FLOW_SCORE","0.47"))
 TREND_SOFT_MOM=float(os.getenv("TREND_SOFT_MOM","0.004"))
 TREND_SOFT_FLOW=float(os.getenv("TREND_SOFT_FLOW","0.15"))
 MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","15"))
@@ -35,7 +34,6 @@ hist={}; state={}; cache={}; ranked=[]; desired=[]; positions={}; last_entry={};
 equity=START; peak_equity=START; trading_halted=False
 metrics={"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"pnl":0.0,"equity":START,"peak_equity":START,"drawdown":0.0,"trading_halted":False}
 
-
 def api(path,params=None):
     for i in range(3):
         try:
@@ -45,10 +43,7 @@ def api(path,params=None):
             time.sleep(.3*(i+1))
     raise RuntimeError("REST failure")
 
-
-def st(s):
-    return state.setdefault(s,{"bid":0.0,"ask":0.0,"bq":0.0,"aq":0.0,"last":0.0})
-
+def st(s): return state.setdefault(s,{"bid":0.0,"ask":0.0,"bq":0.0,"aq":0.0,"last":0.0})
 
 def ema(xs,n):
     if not xs:return 0.0
@@ -56,10 +51,7 @@ def ema(xs,n):
     for x in xs[1:]:e=float(x)*k+e*(1-k)
     return e
 
-
-def avg(xs,d=0.0):
-    return mean(xs) if xs else d
-
+def avg(xs,d=0.0): return mean(xs) if xs else d
 
 def seed(s,iv="1m",limit=80):
     k=api("/fapi/v1/klines",{"symbol":s.upper(),"interval":iv,"limit":limit})
@@ -69,16 +61,11 @@ def seed(s,iv="1m",limit=80):
         for x in k[:-1]:
             q=float(x[7]); tb=float(x[10])*float(x[4])
             h.append({"t":int(x[0]),"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),"c":float(x[4]),"q":q,"buy":tb,"sell":max(q-tb,0.0),"n":int(x[8])})
-        hist[s]=h
-        x=k[-1]; z=st(s); z["last"]=float(x[4])
-        z["bid"]=z["bid"] or z["last"]; z["ask"]=z["ask"] or z["last"]
-        cache.setdefault(s,{})["5m_at"]=0
+        hist[s]=h; x=k[-1]; z=st(s); z["last"]=float(x[4]); z["bid"]=z["bid"] or z["last"]; z["ask"]=z["ask"] or z["last"]; cache.setdefault(s,{})["5m_at"]=0
     else:
         c=[float(x[4]) for x in k]; q=[float(x[7]) for x in k]
-        cache.setdefault(s,{})["5m"]={"e9":ema(c,9),"e21":ema(c,21),"mom":c[-1]/c[-4]-1,"rv":q[-1]/max(avg(q[-20:-1],1e-9),1e-9)}
-        cache[s]["5m_at"]=time.time()
+        cache.setdefault(s,{})["5m"]={"e9":ema(c,9),"e21":ema(c,21),"mom":c[-1]/c[-4]-1,"rv":q[-1]/max(avg(q[-20:-1],1e-9),1e-9)}; cache[s]["5m_at"]=time.time()
     return True
-
 
 def live_bar(s,p,q,m,ts):
     h=hist.setdefault(s,deque(maxlen=120)); b=int(ts//60000)*60000; v=p*q; z=st(s)
@@ -86,7 +73,6 @@ def live_bar(s,p,q,m,ts):
     else:
         x=h[-1]; x["h"]=max(x["h"],p); x["l"]=min(x["l"],p); x["c"]=p; x["q"]+=v; x["buy"]+=v if not m else 0.0; x["sell"]+=v if m else 0.0; x["n"]+=1
     z["last"]=p
-
 
 def features(s):
     h=hist.get(s)
@@ -101,29 +87,30 @@ def features(s):
     vol=avg([abs(c[i]/c[i-1]-1) for i in range(max(1,len(c)-12),len(c))],0.001); zm=abs(ret)/max(vol,1e-6)
     return {"ret":ret,"ret5":ret5,"accel":accel,"atr":atr,"rv":rv,"flow":flow,"spread":spread,"book":book,"break":ret>0 and x["c"]>hi or ret<0 and x["c"]<lo,"z":zm,"q":x["q"]}
 
-
 def higher(s):
     c=cache.setdefault(s,{})
     if time.time()-c.get("5m_at",0)>45:
         if not seed(s,"5m",40):return None
     return c.get("5m")
 
-
 def discover():
+    """Build a broad candidate pool; let live 1m behavior, not 24h rank, decide."""
     info=api("/fapi/v1/exchangeInfo"); ticks={x["symbol"]:x for x in api("/fapi/v1/ticker/24hr")}; now=time.time(); out=[]
     for m in info.get("symbols",[]):
         s=m.get("symbol","")
         if m.get("status")!="TRADING" or m.get("contractType")!="PERPETUAL" or m.get("quoteAsset")!="USDT":continue
         t=ticks.get(s,{})
-        try:q=float(t.get("quoteVolume",0)); ch=abs(float(t.get("priceChangePercent",0)))/100; age=(now*1000-float(m.get("onboardDate",now*1000)))/86400000
+        try:
+            q=float(t.get("quoteVolume",0)); ch=float(t.get("priceChangePercent",0))/100; age=(now*1000-float(m.get("onboardDate",now*1000)))/86400000
         except Exception:continue
         base=s.replace("USDT",""); hinted=any(k in base for k in MEME)
+        # Keep known memes, recent listings, and liquid/high-momentum movers.
+        # This avoids letting stale 24h gainers crowd out fresh 1m setups.
         if q<MIN24 and age>30 and not hinted:continue
-        liq=min(math.log10(max(q,1))/8,1); mom=min(ch/.12,1); fresh=.25 if age<=7 else (.10 if age<=30 else 0); meme=.12 if hinted else 0
-        radar=.38*mom+.32*liq+.18*min(q/20000000,1)+fresh+meme
-        if radar>=.20 or hinted:out.append((s.lower(),min(radar,1),age,q))
+        liq=min(math.log10(max(q,1))/8,1); mom=min(abs(ch)/.10,1); fresh=.28 if age<=7 else (.12 if age<=30 else 0); meme=.18 if hinted else 0
+        radar=.30*liq+.22*mom+fresh+meme
+        if hinted or age<=30 or radar>=.28:out.append((s.lower(),min(radar,1),age,q))
     out.sort(key=lambda x:(x[1],x[3]),reverse=True); return out[:DISCOVERY_N]
-
 
 def market_regime():
     try:
@@ -134,7 +121,6 @@ def market_regime():
         if abs(r)>.012:return "PANIC"
         return "TREND_UP" if e9>e21 and r>0 else "TREND_DOWN" if e9<e21 and r<0 else "CHOP"
     except Exception:return "UNKNOWN"
-
 
 def score(s,radar,age,q,reject):
     f=features(s)
@@ -149,13 +135,16 @@ def score(s,radar,age,q,reject):
     trend_soft=(abs(h["mom"])>=TREND_SOFT_MOM and h["mom"]*side>0 and sf>=TREND_SOFT_FLOW and f["z"]>=1.0)
     trend_ok=bool(trend or trend_soft)
     mom=max(0,min(abs(h["mom"])/.01,1)) if ((h["mom"]*side)>0) else 0
-    s=.25*impulse+.18*accel+.20*flow+.08*book+.10*z+.07*br+.07*trend+.05*mom
+    # 1m behavior dominates the score; radar is only a universe prior.
+    s=.30*impulse+.20*accel+.20*flow+.08*book+.10*z+.06*br+.04*trend+.02*mom+.05*min(radar,1)
     if regime=="CHOP":s-=.06
     if regime=="PANIC":s-=.25
     if regime=="TREND_UP" and side>0:s+=.08
     if regime=="TREND_DOWN" and side<0:s+=.08
     s=max(0,min(1,s)); expected=max(abs(f["ret"])*18000,f["atr"]*20000,abs(f["ret5"])*12000); edge=expected-FEE-SLIP-f["spread"]
-    eligible=s>=ENTRY and edge>=EDGE and impulse>=.18 and flow>=FLOW_MIN and trend_ok and regime!="PANIC"
+    # CHOP is a no-trade regime unless the setup is unusually strong.
+    chop_ok=(regime!="CHOP" or (s>=ENTRY+.08 and impulse>=.40 and f["z"]>=1.4 and flow>=.58))
+    eligible=s>=ENTRY and edge>=EDGE and impulse>=.18 and flow>=FLOW_MIN and trend_ok and regime!="PANIC" and chop_ok
     if not eligible:
         if s<ENTRY:reject["score"]+=1
         elif edge<EDGE:reject["edge"]+=1
@@ -163,8 +152,7 @@ def score(s,radar,age,q,reject):
         elif flow<FLOW_MIN:reject["flow"]+=1
         elif not trend_ok:reject["trend"]+=1
         else:reject["regime"]+=1
-    return {"symbol":s if False else s,"side":"BUY" if side>0 else "SELL","score":s,"edge":edge,"atr":f["atr"],"flow":sf,"book":sb,"z":f["z"],"rv":f["rv"],"ret":f["ret"],"eligible":eligible,"new":age<=7,"radar":radar}
-
+    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":s,"edge":edge,"atr":f["atr"],"flow":sf,"book":sb,"z":f["z"],"rv":f["rv"],"ret":f["ret"],"eligible":eligible,"new":age<=7,"radar":radar}
 
 def rank():
     global ranked,desired,regime
@@ -178,11 +166,11 @@ def rank():
         try:
             c=score(sym,r,a,q,reject)
             if c:c["symbol"]=sym; cand.append(c)
-        except Exception as e:
+        except Exception:
             reject["exception"]+=1; log.exception("SCORE %s failed",sym)
-    cand.sort(key=lambda x:(x["eligible"],x["score"],x["edge"]),reverse=True); ranked=cand[:EXECUTION_N]; desired=[x["symbol"] for x in ranked]
+    cand.sort(key=lambda x:(x["eligible"],x["score"],x["edge"],x["rv"]),reverse=True)
+    ranked=cand[:EXECUTION_N]; desired=[x["symbol"] for x in ranked]
     log.info("ALPHA 1M | regime=%s | discovered=%d | candidates=%d | eligible=%d | reject=%s | %s",regime,len(d),len(cand),sum(x["eligible"] for x in cand),reject," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["edge"]:.0f}bp/{x["side"]}' for x in ranked))
-
 
 def enter(c):
     global trading_halted
@@ -190,13 +178,9 @@ def enter(c):
     if trading_halted or not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<60:return
     px=z["ask"] if c["side"]=="BUY" else z["bid"]
     if px<=0:return
-    stop=max(c["atr"]*1.8,.0025)
-    risk_cash=equity*RISK
-    notional=risk_cash/stop
-    notional=min(notional,equity*.30)
+    stop=max(c["atr"]*1.8,.0025); risk_cash=equity*RISK; notional=min(risk_cash/stop,equity*.30)
     positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
     log.warning("ALPHA ENTRY %s %s score=%.2f edge=%.0fbp notional=%.2f equity=%.2f [DRY RUN]",c["side"],s.upper(),c["score"],c["edge"],notional,equity)
-
 
 def manage():
     global equity,peak_equity,trading_halted
@@ -206,21 +190,14 @@ def manage():
         ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1); stop=max(p["atr"]*1.8,.0025); target=stop*2.2
         reason="TARGET" if ret>=target else "STOP" if ret<=-stop else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
         if reason:
-            net=ret-2*(FEE+SLIP)/10000
-            cash_pnl=net*p["notional"]
-            equity+=cash_pnl
-            peak_equity=max(peak_equity,equity)
-            drawdown=max(0.0,(peak_equity-equity)/max(peak_equity,1e-9))
-            metrics["pnl"]+=cash_pnl; metrics["equity"]=equity; metrics["peak_equity"]=peak_equity; metrics["drawdown"]=drawdown
-            metrics["exits"]+=1
+            net=ret-2*(FEE+SLIP)/10000; cash_pnl=net*p["notional"]; equity+=cash_pnl; peak_equity=max(peak_equity,equity); drawdown=max(0.0,(peak_equity-equity)/max(peak_equity,1e-9))
+            metrics["pnl"]+=cash_pnl; metrics["equity"]=equity; metrics["peak_equity"]=peak_equity; metrics["drawdown"]=drawdown; metrics["exits"]+=1
             if cash_pnl>=0:metrics["wins"]+=1
             else:metrics["losses"]+=1
             positions.pop(s,None)
             if drawdown>=MAX_DRAWDOWN and not trading_halted:
-                trading_halted=True; metrics["trading_halted"]=True
-                log.error("DRAWDOWN PROTECTION | equity=%.2f peak=%.2f drawdown=%.2f%% limit=%.2f%% | NEW ENTRIES HALTED",equity,peak_equity,drawdown*100,MAX_DRAWDOWN*100)
+                trading_halted=True; metrics["trading_halted"]=True; log.error("DRAWDOWN PROTECTION | equity=%.2f peak=%.2f drawdown=%.2f%% limit=%.2f%% | NEW ENTRIES HALTED",equity,peak_equity,drawdown*100,MAX_DRAWDOWN*100)
             log.warning("ALPHA EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,drawdown*100)
-
 
 def on_message(ws,msg):
     try:
@@ -229,7 +206,6 @@ def on_message(ws,msg):
             z=st(s); z["bid"]=float(d.get("b",0)); z["ask"]=float(d.get("a",0)); z["bq"]=float(d.get("B",0)); z["aq"]=float(d.get("A",0))
         elif e=="aggTrade":live_bar(s,float(d["p"]),float(d["q"]),bool(d.get("m")),int(d.get("T",time.time()*1000)))
     except Exception as e:log.debug("ws message: %s",e)
-
 
 def ws_loop():
     while True:
@@ -241,10 +217,9 @@ def ws_loop():
             w.run_forever(ping_interval=20,ping_timeout=10); time.sleep(1)
         except Exception as e:log.warning("WS reconnect: %s",e);time.sleep(2)
 
-
 def main():
     if not DRY_RUN:raise RuntimeError("LIVE EXECUTION DISABLED: DRY_RUN must remain true")
-    log.warning("1M ALPHA ENGINE START | discovery=%d execution=%d positions=%d | compounding=ON risk=%.3f%% max_dd=%.2f%% | DRY_RUN=%s",DISCOVERY_N,EXECUTION_N,MAX_POS,RISK*100,MAX_DRAWDOWN*100,DRY_RUN)
+    log.warning("1M ALPHA ENGINE START | discovery=%d execution=%d positions=%d | 1m-first ranking=ON compounding=ON risk=%.3f%% max_dd=%.2f%% | DRY_RUN=%s",DISCOVERY_N,EXECUTION_N,MAX_POS,RISK*100,MAX_DRAWDOWN*100,DRY_RUN)
     threading.Thread(target=ws_loop,daemon=True).start(); last=0
     while True:
         now=time.time()
