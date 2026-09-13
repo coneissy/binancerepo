@@ -1,9 +1,8 @@
-"""Event-driven, dry-run-first Binance USD-M Futures scalper.
+"""Event-driven, dry-run-first Binance USD-M Futures meme scalper.
 
-Aggressive HFT-inspired paper scalper with a transparent PolyMorph enhancer.
-This is not exchange-colocated HFT. Market data is WebSocket-first; REST is
-used only during startup to build the liquid universe. Live execution remains
-disabled.
+Aggressive HFT-inspired paper mode. The universe is restricted to known meme
+assets that are actually available as USDT perpetuals on Binance at startup.
+Live execution remains disabled.
 """
 import json
 import logging
@@ -28,10 +27,25 @@ MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "5"))
 TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0008"))
 SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0012"))
 MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "8"))
-MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "3000000"))
+MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
 MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))
 COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "0.15"))
-STATE_LEN = int(os.getenv("STATE_LEN", "240"))
+STATE_LEN = int(os.getenv("STATE_LEN", "120"))
+
+# Explicit meme universe. The exchange-info check below means delisted or
+# unavailable contracts are automatically excluded; new memes can be added
+# without changing the rest of the strategy.
+MEME_SYMBOLS = {
+    "DOGE", "SHIB", "1000SHIB", "PEPE", "1000PEPE", "FLOKI", "BONK",
+    "WIF", "MEME", "MEMES", "BRETT", "TURBO", "NEIRO", "1000NEIRO",
+    "PNUT", "ACT", "GOAT", "MOODENG", "MOO", "CHILLGUY", "POPCAT",
+    "DOGS", "CAT", "MEW", "MYRO", "BOME", "SLERF", "SUNDOG", "MOG",
+    "PONKE", "WHY", "TOSHI", "BAN", "FARTCOIN", "ARC", "JELLYJELLY",
+    "PIPPIN", "SWARMS", "AVA", "AVAAI", "TRUMP", "MELANIA", "SPX",
+    "GIGA", "FWOG", "GOCHU", "BROCCOLI", "BABYDOGE", "1000BABYDOGE",
+    "PUMP", "DOOD", "ZEREBRO", "MOTHER", "RETARDIO", "PNUT", "ACT",
+}
+MEME_PREFIXES = ("1000", "1M")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hft-scalper")
@@ -58,6 +72,11 @@ def make_state():
             "prices": deque(maxlen=STATE_LEN), "flow": deque(maxlen=STATE_LEN), "last_event": 0.0}
 
 
+def is_meme_symbol(symbol):
+    base = symbol.upper().removesuffix("USDT")
+    return base in MEME_SYMBOLS or base.startswith(MEME_PREFIXES)
+
+
 def universe():
     info = public("/fapi/v1/exchangeInfo")
     allowed = {x["symbol"].lower() for x in info["symbols"]
@@ -67,17 +86,20 @@ def universe():
     ranked = []
     for t in tickers:
         s = t.get("symbol", "").lower()
-        if s not in allowed:
+        if s not in allowed or not is_meme_symbol(s):
             continue
         try:
             qv = float(t.get("quoteVolume", 0))
             move = abs(float(t.get("priceChangePercent", 0))) / 100.0
             if qv >= MIN_QV:
+                # Prioritize liquid + moving memes for the HFT stream.
                 ranked.append((qv * max(move, 0.002), s))
         except (TypeError, ValueError):
             continue
     ranked.sort(reverse=True)
-    return [s for _, s in ranked[:UNIVERSE_SIZE]]
+    selected = [s for _, s in ranked[:UNIVERSE_SIZE]]
+    log.warning("MEME UNIVERSE | matched=%d selected=%d symbols=%s", len(ranked), len(selected), ",".join(x.upper() for x in selected))
+    return selected
 
 
 def stream_url(symbols):
@@ -89,7 +111,6 @@ def stream_url(symbols):
 
 
 def score_symbol(s):
-    """Aggressive microstructure + PolyMorph score. Returns (side, score, price) or None."""
     st = state.get(s)
     if not st or st["bid"] <= 0 or st["ask"] <= 0:
         metrics["no_book"] += 1
@@ -99,10 +120,8 @@ def score_symbol(s):
     if spread_bps > MAX_SPREAD_BPS:
         metrics["spread_reject"] += 1
         return None
-    ps = st["prices"]
-    fs = st["flow"]
-    # Short warm-up: begin scoring quickly instead of waiting for a long history.
-    if len(ps) < 12 or len(fs) < 6:
+    ps, fs = st["prices"], st["flow"]
+    if len(ps) < 8 or len(fs) < 5:
         metrics["short_state"] += 1
         return None
 
@@ -110,50 +129,36 @@ def score_symbol(s):
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro_edge = (micro - mid) / mid
     momentum = ps[-1] / ps[-min(8, len(ps))] - 1.0
-    recent_flow = sum(fs[-6:])
-    base_slice = fs[-30:-6] if len(fs) > 6 else fs
-    base_flow = sum(abs(x) for x in base_slice) / max(len(base_slice), 1)
+    recent_flow = sum(fs[-5:])
+    base_flow = sum(abs(x) for x in fs[:-5]) / max(len(fs[:-5]), 1)
     flow_edge = recent_flow / max(base_flow, 1e-12)
-    returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 20), len(ps)) if ps[i - 1] > 0]
+    returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 12), len(ps)) if ps[i - 1] > 0]
     vol = math.sqrt(sum(r * r for r in returns) / max(len(returns), 1))
 
-    long_score = 0.0
-    short_score = 0.0
-    long_score += min(max(imbalance, 0.0), 1.0) * 0.35
-    short_score += min(max(-imbalance, 0.0), 1.0) * 0.35
-    long_score += min(max(micro_edge / 0.0005, 0.0), 1.0) * 0.20
-    short_score += min(max(-micro_edge / 0.0005, 0.0), 1.0) * 0.20
-    long_score += min(max(momentum / 0.0015, 0.0), 1.0) * 0.25
-    short_score += min(max(-momentum / 0.0015, 0.0), 1.0) * 0.25
-    long_flow = max(flow_edge, 0.0)
-    short_flow = max(-flow_edge, 0.0)
-    long_score += min(long_flow / 2.0, 1.0) * 0.20
-    short_score += min(short_flow / 2.0, 1.0) * 0.20
+    long_score = (min(max(imbalance, 0.0), 1.0) * 0.35
+                  + min(max(micro_edge / 0.0004, 0.0), 1.0) * 0.20
+                  + min(max(momentum / 0.0010, 0.0), 1.0) * 0.25
+                  + min(max(flow_edge / 1.5, 0.0), 1.0) * 0.20)
+    short_score = (min(max(-imbalance, 0.0), 1.0) * 0.35
+                   + min(max(-micro_edge / 0.0004, 0.0), 1.0) * 0.20
+                   + min(max(-momentum / 0.0010, 0.0), 1.0) * 0.25
+                   + min(max(-flow_edge / 1.5, 0.0), 1.0) * 0.20)
 
-    # Only reject a truly dead market. Aggressive mode should trade active movement.
-    if vol < 0.00001:
+    if vol < 0.00002:
         metrics["vol_reject"] += 1
         return None
 
     side = "BUY" if long_score > short_score else "SELL"
     score = max(long_score, short_score)
-
-    # PolyMorph is a soft enhancer, never a hard gate.
-    if len(ps) >= 30:
-        ai = polymorph_decide(s.upper(), list(ps)[-60:])
-        if ai.action == side and ai.confidence >= (2 / 3):
-            score = min(1.0, score + 0.10)
-            metrics["ai_boosts"] += 1
-        elif ai.action == side and ai.confidence >= (1 / 3):
-            score = min(1.0, score + 0.05)
+    if len(ps) >= 15:
+        ai = polymorph_decide(s.upper(), list(ps)[-40:])
+        if ai.action == side:
+            score = min(1.0, score + (0.08 if ai.confidence >= 2/3 else 0.03))
             metrics["ai_boosts"] += 1
 
     if score < ENTRY_SCORE:
         metrics["score_reject"] += 1
-        if long_score >= short_score:
-            metrics["long_candidates"] += 1
-        else:
-            metrics["short_candidates"] += 1
+        metrics["long_candidates" if long_score >= short_score else "short_candidates"] += 1
         return None
     return side, score, st["ask"] if side == "BUY" else st["bid"]
 
@@ -183,17 +188,7 @@ def manage_positions():
             if px <= 0:
                 continue
             ret = px / p["entry"] - 1.0 if p["side"] == "BUY" else p["entry"] / px - 1.0
-            reason = None
-            if ret >= TP_PCT:
-                reason = "TP"
-            elif ret <= -SL_PCT:
-                reason = "SL"
-            elif now - p["opened"] >= MAX_HOLD:
-                reason = "TIME"
-            else:
-                sig = score_symbol(s)
-                if sig and sig[0] != p["side"] and sig[1] >= ENTRY_SCORE:
-                    reason = "REVERSAL"
+            reason = "TP" if ret >= TP_PCT else "SL" if ret <= -SL_PCT else "TIME" if now - p["opened"] >= MAX_HOLD else None
             if reason:
                 positions.pop(s, None)
                 metrics["exits"] += 1
@@ -208,25 +203,19 @@ def on_message(_, raw):
         d = msg.get("data", msg)
         event = d.get("e")
         s = d.get("s", "").lower()
-        if not s:
-            return
-        st = state.get(s)
-        if st is None:
+        if not s or s not in state:
             return
         metrics["events"] += 1
+        st = state[s]
         if event == "bookTicker":
-            st["bid"] = float(d["b"])
-            st["ask"] = float(d["a"])
-            st["bq"] = float(d["B"])
-            st["aq"] = float(d["A"])
+            st["bid"], st["ask"] = float(d["b"]), float(d["a"])
+            st["bq"], st["aq"] = float(d["B"]), float(d["A"])
             st["last_event"] = time.time()
         elif event == "aggTrade":
-            px = float(d["p"])
-            qty = float(d["q"])
-            signed = -px * qty if d.get("m") else px * qty
+            px, qty = float(d["p"]), float(d["q"])
             st["last"] = px
             st["prices"].append(px)
-            st["flow"].append(signed)
+            st["flow"].append(-px * qty if d.get("m") else px * qty)
             st["last_event"] = time.time()
         else:
             return
@@ -243,13 +232,13 @@ def run_ws(url, shard):
         try:
             log.info("WS shard %d connecting", shard)
             ws = websocket.WebSocketApp(url, on_message=on_message,
-                                        on_error=lambda _, e: log.warning("WS shard %d error: %s", shard, e),
-                                        on_close=lambda _, c, m: log.warning("WS shard %d closed: %s %s", shard, c, m))
+                on_error=lambda _, e: log.warning("WS shard %d error: %s", shard, e),
+                on_close=lambda _, c, m: log.warning("WS shard %d closed: %s %s", shard, c, m))
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception:
             log.exception("WS shard %d failed", shard)
         metrics["reconnects"] += 1
-        time.sleep(2)
+        time.sleep(1)
 
 
 def monitor():
@@ -262,12 +251,14 @@ def main():
     if not DRY_RUN:
         raise RuntimeError("Live execution is disabled in this engine. Keep DRY_RUN=true until paper results are validated.")
     symbols = universe()
+    if not symbols:
+        raise RuntimeError("No Binance meme USDT perpetuals matched the configured liquidity filter.")
     for s in symbols:
         state[s] = make_state()
     shards = [[] for _ in range(min(WS_SHARDS, max(1, len(symbols))))]
     for i, s in enumerate(symbols):
         shards[i % len(shards)].append(s)
-    log.warning("ENGINE STARTED | symbols=%d shards=%d dry_run=%s", len(symbols), len(shards), DRY_RUN)
+    log.warning("ENGINE STARTED | MEME-ONLY symbols=%d shards=%d dry_run=%s", len(symbols), len(shards), DRY_RUN)
     for i, shard_symbols in enumerate(shards, 1):
         threading.Thread(target=run_ws, args=(stream_url(shard_symbols), i), daemon=True).start()
     threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
