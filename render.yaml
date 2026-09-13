@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: binance-ultra-plus
+    name: binance-1m-engine
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -15,32 +15,38 @@ services:
         value: https://demo-fapi.binance.com
       - key: BINANCE_WS_BASE_URL
         value: wss://fstream.binance.com/stream
-      - key: TOP_N
-        value: "20"
-      - key: CHALLENGER_N
+      - key: DISCOVERY_N
+        value: "30"
+      - key: EXECUTION_N
         value: "10"
       - key: RANK_REFRESH_SECONDS
         value: "30"
       - key: MAX_SIMULTANEOUS_POSITIONS
-        value: "3"
-      - key: ENTRY_SCORE
-        value: "0.78"
-      - key: CHALLENGER_GAP
-        value: "0.06"
-      - key: MIN_24H_QUOTE_VOLUME
-        value: "1000000"
-      - key: MIN_1M_QUOTE_VOLUME
-        value: "50000"
-      - key: MAX_SPREAD_BPS
         value: "10"
-      - key: ENTRY_COOLDOWN_SECONDS
-        value: "45"
+      - key: ENTRY_SCORE
+        value: "0.66"
+      - key: MIN_EDGE_BPS
+        value: "9"
+      - key: MIN_24H_QUOTE_VOLUME
+        value: "300000"
+      - key: MIN_1M_QUOTE_VOLUME
+        value: "8000"
+      - key: MAX_SPREAD_BPS
+        value: "15"
+      - key: WARMUP_BARS
+        value: "25"
       - key: MAX_HOLD_SECONDS
-        value: "180"
+        value: "300"
       - key: EST_FEE_BPS
         value: "4"
       - key: EST_SLIPPAGE_BPS
         value: "3"
+      - key: BASE_RISK_PCT
+        value: "0.002"
+      - key: SIM_START_EQUITY
+        value: "10000"
+      - key: MAX_DRAWDOWN_PCT
+        value: "0.08"
       - key: DRY_RUN
         value: "true"
       - key: LOG_LEVEL
