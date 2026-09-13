@@ -14,7 +14,7 @@ from polymorph_ai import decide as polymorph_decide
 BASE = os.getenv("BINANCE_BASE_URL", "https://demo-fapi.binance.com")
 WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "0"))  # 0 = every matched meme contract
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "0"))
 WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
 ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.30"))
 MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "5"))
@@ -71,14 +71,7 @@ ws_lock = threading.RLock()
 ws_clients = {}
 shard_symbols = {}
 ws_request_id = 0
-metrics = {
-    "events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0,
-    "no_book": 0, "short_state": 0, "spread_reject": 0, "vol_reject": 0,
-    "score_reject": 0, "cost_reject": 0, "flow_reject": 0, "liquidity_reject": 0,
-    "long_candidates": 0, "short_candidates": 0, "ai_boosts": 0, "cost_checks": 0,
-    "new_listings": 0, "new_listing_entries": 0, "listing_refreshes": 0,
-    "ws_subscriptions": 0, "ws_subscription_errors": 0,
-}
+metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0, "no_book": 0, "short_state": 0, "spread_reject": 0, "vol_reject": 0, "score_reject": 0, "cost_reject": 0, "flow_reject": 0, "liquidity_reject": 0, "long_candidates": 0, "short_candidates": 0, "ai_boosts": 0, "cost_checks": 0, "new_listings": 0, "new_listing_entries": 0, "listing_refreshes": 0, "ws_subscriptions": 0, "ws_subscription_errors": 0}
 performance = defaultdict(lambda: {"trades": 0, "wins": 0, "losses": 0, "return": 0.0})
 
 
@@ -89,11 +82,7 @@ def public(path, params=None):
 
 
 def make_state():
-    return {
-        "bid": 0.0, "ask": 0.0, "bq": 0.0, "aq": 0.0, "last": 0.0,
-        "prices": deque(maxlen=STATE_LEN), "flow": deque(maxlen=STATE_LEN),
-        "flow_abs": deque(maxlen=STATE_LEN), "last_event": 0.0,
-    }
+    return {"bid": 0.0, "ask": 0.0, "bq": 0.0, "aq": 0.0, "last": 0.0, "prices": deque(maxlen=STATE_LEN), "flow": deque(maxlen=STATE_LEN), "flow_abs": deque(maxlen=STATE_LEN), "last_event": 0.0}
 
 
 def is_meme_symbol(symbol):
@@ -107,8 +96,7 @@ def exchange_symbols():
     for x in info.get("symbols", []):
         if x.get("status") != "TRADING" or x.get("contractType") != "PERPETUAL" or x.get("quoteAsset") != "USDT":
             continue
-        s = x["symbol"].lower()
-        result[s] = {"onboard": int(x.get("onboardDate", 0) or 0), "pair": x.get("pair", "")}
+        result[x["symbol"].lower()] = {"onboard": int(x.get("onboardDate", 0) or 0), "pair": x.get("pair", "")}
     return result
 
 
@@ -131,6 +119,10 @@ def discover_new_listings(symbol_meta, startup=False):
             metrics["new_listings"] += 1
             log.warning("NEW MEME LISTING DETECTED | %s", s.upper())
     return fresh
+
+
+def qv_allowed(s):
+    return quote_volume.get(s, 0.0) >= MIN_QV
 
 
 def universe():
@@ -157,15 +149,6 @@ def universe():
         selected = selected[:UNIVERSE_SIZE]
     log.warning("MEME UNIVERSE | matched=%d selected=%d symbols=%s", len(ranked), len(selected), ",".join(x.upper() for x in selected))
     return selected
-
-
-def qv_allowed(s):
-    return quote_volume.get(s, 0.0) >= MIN_QV
-
-
-def stream_url(symbols):
-    streams = [f"{s}@bookTicker" for s in symbols] + [f"{s}@aggTrade" for s in symbols]
-    return WS_BASE + "?streams=" + "/".join(streams)
 
 
 def _clamp(x, lo=0.0, hi=1.0):
@@ -198,8 +181,8 @@ def score_symbol(s):
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro_edge = (micro - mid) / mid
     momentum = ps[-1] / ps[-min(8, len(ps))] - 1.0
-    recent = list(fs[-5:])
-    previous = list(fs[-10:-5])
+    recent = list(fs)[-5:]
+    previous = list(fs)[-10:-5]
     recent_flow, previous_flow = sum(recent), sum(previous)
     previous_abs = sum(abs(x) for x in previous) / 5.0
     flow_edge = recent_flow / max(previous_abs * 5.0, 1e-12)
@@ -209,16 +192,8 @@ def score_symbol(s):
     if vol < 0.00002 and not is_new:
         metrics["vol_reject"] += 1
         return None
-    long_score = (
-        _clamp(imbalance) * 0.30 + _clamp(micro_edge / 0.0004) * 0.18 +
-        _clamp(momentum / 0.0010) * 0.22 + _clamp(flow_edge / 1.5) * 0.18 +
-        _clamp(directional_accel) * 0.12
-    )
-    short_score = (
-        _clamp(-imbalance) * 0.30 + _clamp(-micro_edge / 0.0004) * 0.18 +
-        _clamp(-momentum / 0.0010) * 0.22 + _clamp(-flow_edge / 1.5) * 0.18 +
-        _clamp(-directional_accel) * 0.12
-    )
+    long_score = _clamp(imbalance) * 0.30 + _clamp(micro_edge / 0.0004) * 0.18 + _clamp(momentum / 0.0010) * 0.22 + _clamp(flow_edge / 1.5) * 0.18 + _clamp(directional_accel) * 0.12
+    short_score = _clamp(-imbalance) * 0.30 + _clamp(-micro_edge / 0.0004) * 0.18 + _clamp(-momentum / 0.0010) * 0.22 + _clamp(-flow_edge / 1.5) * 0.18 + _clamp(-directional_accel) * 0.12
     side = "BUY" if long_score > short_score else "SELL"
     signed_flow = flow_edge if side == "BUY" else -flow_edge
     if signed_flow < -0.15:
@@ -262,19 +237,12 @@ def enter(s, side, score, price, target, stop, expected_edge, is_new=False):
         cooldown = NEW_LISTING_COOLDOWN if is_new else COOLDOWN
         if now - last_entry.get(s, 0.0) < cooldown:
             return
-        positions[s] = {
-            "side": side, "entry": price, "opened": now, "score": score,
-            "tp": target, "sl": stop, "expected_edge": expected_edge, "new_listing": is_new,
-        }
+        positions[s] = {"side": side, "entry": price, "opened": now, "score": score, "tp": target, "sl": stop, "expected_edge": expected_edge, "new_listing": is_new}
         last_entry[s] = now
         metrics["entries"] += 1
         if is_new:
             metrics["new_listing_entries"] += 1
-    log.warning(
-        "ENTRY %s %s score=%.3f edge=%.3f%% tp=%.3f%% sl=%.3f%% price=%.10g%s [DRY RUN]",
-        side, s.upper(), score, expected_edge * 100, target * 100, stop * 100, price,
-        " NEW-LISTING-SNIPER" if is_new else "",
-    )
+    log.warning("ENTRY %s %s score=%.3f edge=%.3f%% tp=%.3f%% sl=%.3f%% price=%.10g%s [DRY RUN]", side, s.upper(), score, expected_edge * 100, target * 100, stop * 100, price, " NEW-LISTING-SNIPER" if is_new else "")
 
 
 def manage_positions():
@@ -300,10 +268,7 @@ def manage_positions():
                 perf["wins" if ret > 0 else "losses"] += 1
                 exits.append((s, p, px, ret, reason, now - p["opened"]))
     for s, p, px, ret, reason, held in exits:
-        log.warning(
-            "EXIT %s %s return=%.3f%% held=%.2fs%s",
-            reason, s.upper(), ret * 100, held, " NEW-LISTING" if p.get("new_listing") else "",
-        )
+        log.warning("EXIT %s %s return=%.3f%% held=%.2fs%s", reason, s.upper(), ret * 100, held, " NEW-LISTING" if p.get("new_listing") else "")
 
 
 def on_message(_, raw):
@@ -358,87 +323,79 @@ def _subscribe(ws, symbols, shard):
     try:
         ws.send(json.dumps(payload))
         metrics["ws_subscriptions"] += len(symbols)
-        log.warning("WS shard %d subscribed new symbols=%s", shard, ",".join(s.upper() for s in symbols))
+        log.info("WS SUBSCRIBE shard=%d symbols=%d", shard, len(symbols))
         return True
     except Exception:
         metrics["ws_subscription_errors"] += 1
-        log.exception("WS shard %d dynamic subscribe failed", shard)
+        log.exception("WS subscription failed shard=%d", shard)
         return False
 
 
-def add_symbols_to_live_ws(symbols):
-    fresh = [s for s in symbols if is_meme_symbol(s)]
-    if not fresh:
-        return
-    with ws_lock:
-        for s in fresh:
-            state.setdefault(s, make_state())
-            if any(s in items for items in shard_symbols.values()):
-                continue
-            if not shard_symbols:
-                shard = 1
-                shard_symbols[shard] = set()
-            else:
-                shard = min(shard_symbols, key=lambda k: len(shard_symbols[k]))
-            shard_symbols[shard].add(s)
-            ws = ws_clients.get(shard)
-            if ws and ws.sock and ws.sock.connected:
-                _subscribe(ws, [s], shard)
+def _on_open(ws, shard):
+    _subscribe(ws, shard_symbols.get(shard, []), shard)
 
 
-def run_ws(initial_symbols, shard):
-    with ws_lock:
-        shard_symbols.setdefault(shard, set(initial_symbols))
+def _on_error(_, error):
+    log.error("WS error: %s", error)
+
+
+def _on_close(_, code, msg):
+    log.warning("WS closed code=%s msg=%s", code, msg)
+
+
+def _run_shard(shard, symbols):
+    shard_symbols[shard] = list(symbols)
     while True:
         try:
-            with ws_lock:
-                symbols = sorted(shard_symbols.get(shard, set()))
-            if not symbols:
-                time.sleep(1)
-                continue
-            log.info("WS shard %d connecting symbols=%d", shard, len(symbols))
-            ws = websocket.WebSocketApp(
-                stream_url(symbols),
-                on_message=on_message,
-                on_error=lambda _, e: log.warning("WS shard %d error: %s", shard, e),
-                on_close=lambda _, c, m: log.warning("WS shard %d closed: %s %s", shard, c, m),
-                on_open=lambda w: log.info("WS shard %d opened symbols=%d", shard, len(symbols)),
-            )
+            ws = websocket.WebSocketApp(WS_BASE, on_open=lambda w: _on_open(w, shard), on_message=on_message, on_error=_on_error, on_close=_on_close)
             with ws_lock:
                 ws_clients[shard] = ws
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception:
-            log.exception("WS shard %d failed", shard)
-        finally:
-            with ws_lock:
-                if ws_clients.get(shard) is ws if 'ws' in locals() else False:
-                    ws_clients.pop(shard, None)
+            log.exception("WS shard %d crashed", shard)
         metrics["reconnects"] += 1
         time.sleep(1)
 
 
-def monitor():
-    while True:
-        manage_positions()
-        time.sleep(0.01)
+def subscribe_new_symbols(symbols):
+    if not symbols:
+        return
+    with ws_lock:
+        current = [set(shard_symbols.get(i, [])) for i in range(WS_SHARDS)]
+        for s in symbols:
+            if any(s in group for group in current):
+                continue
+            shard = min(range(WS_SHARDS), key=lambda i: len(current[i]))
+            shard_symbols.setdefault(shard, []).append(s)
+            current[shard].add(s)
+            ws = ws_clients.get(shard)
+            if ws:
+                _subscribe(ws, [s], shard)
+            state.setdefault(s, make_state())
 
 
 def listing_monitor():
     while True:
+        time.sleep(LISTING_REFRESH_SECONDS)
         try:
             meta = exchange_symbols()
-            metrics["listing_refreshes"] += 1
             fresh = discover_new_listings(meta, startup=False)
-            meme_fresh = [s for s in fresh if is_meme_symbol(s)]
-            if meme_fresh:
-                log.warning("NEW LISTINGS QUEUED + SUBSCRIBING | %s", ",".join(s.upper() for s in meme_fresh))
-                add_symbols_to_live_ws(meme_fresh)
-            else:
-                # Keep all already-known meme contracts available to scoring after a reconnect.
-                add_symbols_to_live_ws([s for s in known_symbols if is_meme_symbol(s)])
+            fresh_meme = [s for s in fresh if is_meme_symbol(s)]
+            if fresh_meme:
+                subscribe_new_symbols(fresh_meme)
+            metrics["listing_refreshes"] += 1
         except Exception:
-            log.exception("listing monitor error")
-        time.sleep(LISTING_REFRESH_SECONDS)
+            log.exception("listing monitor failed")
+
+
+def stats_loop():
+    while True:
+        time.sleep(10)
+        manage_positions()
+        total_return = sum(v["return"] for v in performance.values())
+        total_trades = sum(v["trades"] for v in performance.values())
+        wins = sum(v["wins"] for v in performance.values())
+        log.warning("STATS events=%d signals=%d entries=%d exits=%d trades=%d wins=%d return=%.3f%% positions=%d new_entries=%d rejects(score=%d cost=%d flow=%d spread=%d liq=%d vol=%d)", metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], total_trades, wins, total_return * 100, len(positions), metrics["new_listing_entries"], metrics["score_reject"], metrics["cost_reject"], metrics["flow_reject"], metrics["spread_reject"], metrics["liquidity_reject"], metrics["vol_reject"])
 
 
 def main():
@@ -446,33 +403,17 @@ def main():
         raise RuntimeError("Live execution is disabled in this engine. Keep DRY_RUN=true until paper results are validated.")
     symbols = universe()
     if not symbols:
-        raise RuntimeError("No Binance meme USDT perpetuals matched the configured universe.")
+        raise RuntimeError("No matching meme USDT perpetuals found")
     for s in symbols:
         state[s] = make_state()
-    shard_count = min(WS_SHARDS, max(1, len(symbols)))
-    shards = [[] for _ in range(shard_count)]
+    shards = [[] for _ in range(WS_SHARDS)]
     for i, s in enumerate(symbols):
-        shards[i % shard_count].append(s)
-    for i, shard in enumerate(shards, 1):
-        shard_symbols[i] = set(shard)
-    log.warning(
-        "ENGINE STARTED | MEME-ONLY symbols=%d shards=%d dry_run=%s new_listing_window=%ss all_meme=%s",
-        len(symbols), shard_count, DRY_RUN, NEW_LISTING_WINDOW, UNIVERSE_SIZE == 0,
-    )
-    for i, shard in enumerate(shards, 1):
-        threading.Thread(target=run_ws, args=(shard, i), daemon=True).start()
-    threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
-    threading.Thread(target=listing_monitor, name="listing-monitor", daemon=True).start()
+        shards[i % WS_SHARDS].append(s)
+    for shard, group in enumerate(shards):
+        if group:
+            threading.Thread(target=_run_shard, args=(shard, group), daemon=True).start()
+    threading.Thread(target=listing_monitor, daemon=True).start()
+    threading.Thread(target=stats_loop, daemon=True).start()
+    log.warning("STARTED DRY-RUN | symbols=%d shards=%d max_positions=%d", len(symbols), WS_SHARDS, MAX_POSITIONS)
     while True:
-        time.sleep(10)
-        log.info(
-            "metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d new_listings=%d new_entries=%d listing_refreshes=%d ws_sub=%d ws_sub_err=%d rejects={book:%d state:%d liq:%d spread:%d vol:%d flow:%d cost:%d score:%d} ai_boosts=%d",
-            metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], metrics["reconnects"], len(positions),
-            metrics["new_listings"], metrics["new_listing_entries"], metrics["listing_refreshes"], metrics["ws_subscriptions"], metrics["ws_subscription_errors"],
-            metrics["no_book"], metrics["short_state"], metrics["liquidity_reject"], metrics["spread_reject"], metrics["vol_reject"],
-            metrics["flow_reject"], metrics["cost_reject"], metrics["score_reject"], metrics["ai_boosts"],
-        )
-
-
-if __name__ == "__main__":
-    main()
+        time.sleep(1)
