@@ -11,6 +11,7 @@ def discover(engine):
     """Scan every active Binance USDT perpetual, then rank the best 1m setups."""
     info = engine.api("/fapi/v1/exchangeInfo")
     ticks = {x["symbol"]: x for x in engine.api("/fapi/v1/ticker/24hr")}
+    now_ms = time.time() * 1000.0
     allowed = {
         m.get("symbol") for m in info.get("symbols", [])
         if m.get("status") == "TRADING"
@@ -18,11 +19,16 @@ def discover(engine):
         and m.get("quoteAsset") == "USDT"
     }
     candidates = []
-    for s in allowed:
+    for m in info.get("symbols", []):
+        s = m.get("symbol", "")
+        if s not in allowed:
+            continue
         t = ticks.get(s, {})
         try:
             q24 = float(t.get("quoteVolume", 0.0))
             ch24 = abs(float(t.get("priceChangePercent", 0.0))) / 100.0
+            onboard_ms = float(m.get("onboardDate", now_ms))
+            age_days = max(0.0, (now_ms - onboard_ms) / 86400000.0)
         except (TypeError, ValueError):
             continue
         if q24 < engine.MIN24:
@@ -44,19 +50,14 @@ def discover(engine):
             if h:
                 momentum = min(abs(h.get("mom", 0.0)) / 0.02, 1.0)
         except Exception:
-            pass
+            engine.log.debug("universe feature warmup failed for %s", sl, exc_info=True)
         liquidity = min(math.log10(max(q24, 1.0)) / 10.0, 1.0)
         micro_volume = min(q1m / max(engine.MIN1, 1.0), 3.0) / 3.0
-        dynamic = (
-            0.30 * vol_score
-            + 0.20 * impulse
-            + 0.20 * momentum
-            + 0.20 * liquidity
-            + 0.10 * micro_volume
-        )
-        candidates.append((sl, dynamic, q24, q1m, ch24))
+        dynamic = 0.30 * vol_score + 0.20 * impulse + 0.20 * momentum + 0.20 * liquidity + 0.10 * micro_volume
+        # rank() expects exactly (symbol, radar, age_days, quote_volume).
+        candidates.append((sl, dynamic, age_days, q24))
 
-    candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    candidates.sort(key=lambda x: (x[1], x[3]), reverse=True)
     selected = candidates[:TOP_N]
     _cache.update({"at": time.time(), "symbols": [x[0] for x in selected]})
     engine.log.info(
