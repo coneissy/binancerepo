@@ -7,10 +7,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hft_scalper_30s as engine
 import top_gainer_regime
 import htf_regime
+import dynamic_largecap_universe
 
 # Higher timeframe architecture: 1h primary regime, 15m confirmation,
 # 5m setup confirmation and 1m execution timing.
 htf_regime.install(engine)
+# Dynamic universe: top large-cap pool, then select the 10 with strongest
+# live volatility, relative volume and momentum.
+engine.discover = lambda: dynamic_largecap_universe.discover(engine)
 # Keep the existing duplicate-symbol cooldown guard.
 top_gainer_regime.install_symbol_guard(engine)
 
@@ -43,7 +47,8 @@ def get_stats():
         'uptime_seconds': round(time.time() - START_TIME, 1),
         'regime': regime,
         'regime_source': '1H_PRIMARY_15M_CONFIRM',
-        'top_gainers_n': top_gainer_regime.TOP_GAINERS_N,
+        'universe_mode': 'TOP_LARGECAP_HIGH_VOL_10',
+        'largecap_pool': dynamic_largecap_universe.POOL,
         'universe_ranked': len(ranked),
         'discovery_n': engine.DISCOVERY_N,
         'execution_n': engine.EXECUTION_N,
@@ -80,7 +85,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px s
 .pill{padding:5px 9px;border-radius:20px;background:#1d2736;font-size:12px}.section{margin-top:16px}.muted{color:#8996aa}.refresh{font-size:12px;color:#8996aa}
 @media(max-width:750px){.grid{grid-template-columns:repeat(2,1fr)}.value{font-size:22px}}
 </style></head><body><div class="wrap">
-<div class="bar"><div><h1>⚡ Binance HTF Alpha Engine</h1><div class="sub">Dynamic Meme Universe · 1H regime · 15M confirmation · 5M setup · 1M execution · Paper Trading</div></div><div id="status" class="pill">CONNECTING</div></div>
+<div class="bar"><div><h1>⚡ Binance HTF Alpha Engine</h1><div class="sub">Top Large-Cap Universe · High Volatility · 1H regime · 15M confirmation · 5M setup · 1M execution · Paper Trading</div></div><div id="status" class="pill">CONNECTING</div></div>
 <div class="grid">
 <div class="card"><div class="label">Net P&L</div><div id="pnl" class="value">—</div></div>
 <div class="card"><div class="label">Win Rate</div><div id="win" class="value">—</div></div>
@@ -95,7 +100,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px s
 <div class="card"><div class="label">Signals</div><div id="signals" class="value">—</div></div>
 <div class="card"><div class="label">Bars</div><div id="bars" class="value">—</div></div>
 </div>
-<div class="section card"><div class="bar"><b>Top Ranked Meme / Momentum Coins</b><span id="refresh" class="refresh">Auto refresh 3s</span></div><table><thead><tr><th>#</th><th>Symbol</th></tr></thead><tbody id="coins"></tbody></table></div>
+<div class="section card"><div class="bar"><b>Top 10 Large-Cap / High-Volatility Candidates</b><span id="refresh" class="refresh">Auto refresh 3s</span></div><table><thead><tr><th>#</th><th>Symbol</th></tr></thead><tbody id="coins"></tbody></table></div>
 <div class="section card"><div class="bar"><b>HTF Engine Activity</b></div><div class="muted" id="activity">Loading...</div></div>
 </div>
 <script>
@@ -106,7 +111,7 @@ win.textContent=d.win_rate_pct.toFixed(2)+'%';pf.textContent=d.profit_factor===n
 entries.textContent=d.entries;exits.textContent=d.exits;open.textContent=d.open_positions;universe.textContent=d.universe_ranked+'/'+d.discovery_n;
 equity.textContent=d.equity.toFixed(2);dd.textContent=d.drawdown_pct.toFixed(3)+'%';signals.textContent=d.signals;bars.textContent=d.completed_bars;
 coins.innerHTML=(d.top_10||[]).map((s,i)=>'<tr><td>'+(i+1)+'</td><td><b>'+s+'</b></td></tr>').join('')||'<tr><td colspan="2" class="muted">No ranked symbols yet</td></tr>';
-activity.textContent='Architecture: 1H primary → 15M confirmation → 5M setup → 1M execution · Regime: '+d.regime+' · Execution set: '+d.execution_n+' · Signals: '+d.signals+' · Completed 1m bars: '+d.completed_bars+' · Uptime: '+Math.round(d.uptime_seconds/60)+' min'+(d.trading_halted?' · TRADING HALTED':'');
+activity.textContent='Universe: top '+d.largecap_pool+' market-cap pool → dynamic high-volatility top 10 · Architecture: 1H primary → 15M confirmation → 5M setup → 1M execution · Regime: '+d.regime+' · Signals: '+d.signals+' · Completed 1m bars: '+d.completed_bars+' · Uptime: '+Math.round(d.uptime_seconds/60)+' min'+(d.trading_halted?' · TRADING HALTED':'');
 }catch(e){status.textContent='OFFLINE';status.className='pill bad';}}
 update();setInterval(update,3000);
 </script></body></html>'''
@@ -122,7 +127,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 'engine': 'alpha-htf-1m',
                 'dry_run': True,
                 'regime_source': '1H_PRIMARY_15M_CONFIRM',
-                'top_gainers_n': top_gainer_regime.TOP_GAINERS_N,
+                'universe_mode': 'TOP_LARGECAP_HIGH_VOL_10',
             }
             self._json(payload)
         elif path == '/stats.json':
