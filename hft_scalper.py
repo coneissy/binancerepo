@@ -1,7 +1,8 @@
 """Event-driven, dry-run-first Binance USD-M Futures scalper.
 
-This is HFT-inspired, not exchange-colocated HFT. Market data is WebSocket-first;
-REST is used only during startup to build the liquid universe.
+HFT-inspired paper scalper with a transparent PolyMorph consensus enhancer.
+Market data is WebSocket-first; REST is used only during startup to build the
+liquid universe. Live execution remains disabled.
 """
 import json
 import logging
@@ -14,19 +15,21 @@ from collections import deque
 import requests
 import websocket
 
+from polymorph_ai import decide as polymorph_decide
+
 BASE = os.getenv("BINANCE_BASE_URL", "https://demo-fapi.binance.com")
 WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "100"))
 WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
-ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.60"))
+ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.45"))
 MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
-TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0025"))
-SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0015"))
-MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "45"))
+TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0015"))
+SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0010"))
+MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "15"))
 MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "8"))
-COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "3"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "12"))
+COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "0.50"))
 STATE_LEN = int(os.getenv("STATE_LEN", "240"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -39,7 +42,8 @@ last_entry = {}
 lock = threading.RLock()
 metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0,
            "no_book": 0, "short_state": 0, "spread_reject": 0, "vol_reject": 0,
-           "score_reject": 0, "long_candidates": 0, "short_candidates": 0}
+           "score_reject": 0, "long_candidates": 0, "short_candidates": 0,
+           "ai_boosts": 0}
 
 
 def public(path, params=None):
@@ -84,7 +88,7 @@ def stream_url(symbols):
 
 
 def score_symbol(s):
-    """Microstructure score. Returns (side, score, fill_price) or None."""
+    """Aggressive microstructure + PolyMorph score. Returns (side, score, price) or None."""
     st = state.get(s)
     if not st or st["bid"] <= 0 or st["ask"] <= 0:
         metrics["no_book"] += 1
@@ -99,6 +103,7 @@ def score_symbol(s):
     if len(ps) < 20 or len(fs) < 10:
         metrics["short_state"] += 1
         return None
+
     imbalance = (st["bq"] - st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro_edge = (micro - mid) / mid
@@ -106,7 +111,6 @@ def score_symbol(s):
     recent_flow = sum(fs[-8:])
     base_flow = sum(abs(x) for x in fs[-40:-8]) / max(len(fs[-40:-8]), 1)
     flow_edge = recent_flow / max(base_flow, 1e-12)
-    # Direction-neutral realized volatility over the recent trade-price window.
     returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 20), len(ps)) if ps[i - 1] > 0]
     vol = math.sqrt(sum(r * r for r in returns) / max(len(returns), 1))
 
@@ -118,16 +122,29 @@ def score_symbol(s):
     short_score += min(max(-micro_edge / 0.0005, 0.0), 1.0) * 0.20
     long_score += min(max(momentum / 0.0015, 0.0), 1.0) * 0.25
     short_score += min(max(-momentum / 0.0015, 0.0), 1.0) * 0.25
-    # Use the absolute directional flow strength for the matching side.
     long_flow = max(flow_edge, 0.0)
     short_flow = max(-flow_edge, 0.0)
     long_score += min(long_flow / 2.0, 1.0) * 0.20
     short_score += min(short_flow / 2.0, 1.0) * 0.20
 
-    if vol < 0.0002:
+    if vol < 0.00005:
         metrics["vol_reject"] += 1
         return None
+
+    side = "BUY" if long_score > short_score else "SELL"
     score = max(long_score, short_score)
+
+    # PolyMorph is an enhancer, not a hard 2-of-3 gate. This deliberately
+    # favors frequency while requiring at least a modest microstructure edge.
+    if len(ps) >= 30:
+        ai = polymorph_decide(s.upper(), list(ps)[-60:])
+        if ai.action == side and ai.confidence >= (2 / 3):
+            score = min(1.0, score + 0.10)
+            metrics["ai_boosts"] += 1
+        elif ai.action == side and ai.confidence >= (1 / 3):
+            score = min(1.0, score + 0.05)
+            metrics["ai_boosts"] += 1
+
     if score < ENTRY_SCORE:
         metrics["score_reject"] += 1
         if long_score >= short_score:
@@ -135,7 +152,6 @@ def score_symbol(s):
         else:
             metrics["short_candidates"] += 1
         return None
-    side = "BUY" if long_score > short_score else "SELL"
     return side, score, st["ask"] if side == "BUY" else st["bid"]
 
 
@@ -254,10 +270,10 @@ def main():
     threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
     while True:
         time.sleep(10)
-        log.info("metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d rejections={book:%d state:%d spread:%d vol:%d score:%d candidates:L%d/S%d}",
+        log.info("metrics events=%d signals=%d entries=%d exits=%d reconnects=%d positions=%d rejections={book:%d state:%d spread:%d vol:%d score:%d candidates:L%d/S%d ai_boosts:%d}",
                  metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], metrics["reconnects"], len(positions),
                  metrics["no_book"], metrics["short_state"], metrics["spread_reject"], metrics["vol_reject"], metrics["score_reject"],
-                 metrics["long_candidates"], metrics["short_candidates"])
+                 metrics["long_candidates"], metrics["short_candidates"], metrics["ai_boosts"])
 
 
 if __name__ == "__main__":
