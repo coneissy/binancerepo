@@ -1,23 +1,30 @@
-"""Dynamic all-USDT perpetual universe using live Binance market data."""
+"""Fast dynamic all-USDT perpetual universe using live Binance market data."""
 import math
 import time
 
 REFRESH = 30.0
-TOP_N = 10
 _cache = {"at": 0.0, "symbols": []}
 
 
 def discover(engine):
-    """Scan every active Binance USDT perpetual, then rank the best 1m setups."""
+    """Scan every active USDT perpetual cheaply, then let rank() do 1m feature scoring.
+
+    IMPORTANT: do not seed candles for every symbol here.  That caused hundreds of
+    REST calls during discovery and could block the 30-second ranking loop for many
+    minutes.  We use the live 24h ticker to reduce the full universe to a liquid,
+    volatile discovery pool; rank() then warms only that pool and selects execution N.
+    """
     info = engine.api("/fapi/v1/exchangeInfo")
-    ticks = {x["symbol"]: x for x in engine.api("/fapi/v1/ticker/24hr")}
+    ticks = {x.get("symbol"): x for x in engine.api("/fapi/v1/ticker/24hr")}
     now_ms = time.time() * 1000.0
     allowed = {
-        m.get("symbol") for m in info.get("symbols", [])
+        m.get("symbol")
+        for m in info.get("symbols", [])
         if m.get("status") == "TRADING"
         and m.get("contractType") == "PERPETUAL"
         and m.get("quoteAsset") == "USDT"
     }
+
     candidates = []
     for m in info.get("symbols", []):
         s = m.get("symbol", "")
@@ -33,36 +40,23 @@ def discover(engine):
             continue
         if q24 < engine.MIN24:
             continue
-        sl = s.lower()
-        vol_score = min(ch24 / 0.08, 1.0)
-        impulse = 0.0
-        momentum = 0.0
-        q1m = 0.0
-        try:
-            if sl not in engine.hist or len(engine.hist[sl]) < engine.WARMUP:
-                engine.seed(sl, "1m", 80)
-            f = engine.features(sl)
-            h = engine.higher(sl)
-            if f:
-                vol_score = max(vol_score, min(max(f.get("atr", 0.0) / 0.0025, 0.0), 1.0))
-                impulse = min(max((f.get("rv", 1.0) - 1.0) / 2.0, 0.0), 1.0)
-                q1m = float(f.get("q", 0.0))
-            if h:
-                momentum = min(abs(h.get("mom", 0.0)) / 0.02, 1.0)
-        except Exception:
-            engine.log.debug("universe feature warmup failed for %s", sl, exc_info=True)
+
+        # Fast universe prior. No per-symbol klines/order-book calls here.
         liquidity = min(math.log10(max(q24, 1.0)) / 10.0, 1.0)
-        micro_volume = min(q1m / max(engine.MIN1, 1.0), 3.0) / 3.0
-        dynamic = 0.30 * vol_score + 0.20 * impulse + 0.20 * momentum + 0.20 * liquidity + 0.10 * micro_volume
-        # rank() expects exactly (symbol, radar, age_days, quote_volume).
-        candidates.append((sl, dynamic, age_days, q24))
+        volatility = min(ch24 / 0.08, 1.0)
+        freshness = 0.25 if age_days <= 7 else (0.10 if age_days <= 30 else 0.0)
+        dynamic = 0.65 * volatility + 0.30 * liquidity + freshness
+        candidates.append((s.lower(), dynamic, age_days, q24))
 
     candidates.sort(key=lambda x: (x[1], x[3]), reverse=True)
-    selected = candidates[:TOP_N]
+    # Return the discovery pool; rank() performs the expensive 1m/5m scoring only
+    # on this bounded set and then keeps EXECUTION_N (currently 10).
+    pool_n = max(int(getattr(engine, "DISCOVERY_N", 50)), 10)
+    selected = candidates[:pool_n]
     _cache.update({"at": time.time(), "symbols": [x[0] for x in selected]})
     engine.log.info(
-        "ALL-USDT LIVE VOLUME | scanned=%d | liquid=%d | selected=%d | %s",
+        "ALL-USDT LIVE VOLUME | scanned=%d | liquid=%d | discovery_pool=%d | %s",
         len(allowed), len(candidates), len(selected),
-        " ".join(x[0].upper() for x in selected),
+        " ".join(x[0].upper() for x in selected[:10]),
     )
     return selected
