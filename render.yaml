@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: binance-futures-scalper
+    name: binance-ultra-plus
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -15,25 +15,31 @@ services:
         value: https://demo-fapi.binance.com
       - key: BINANCE_WS_BASE_URL
         value: wss://fstream.binance.com/stream
-      - key: UNIVERSE_SIZE
-        value: "100"
-      - key: WS_SHARDS
-        value: "5"
+      - key: TOP_N
+        value: "20"
+      - key: CHALLENGER_N
+        value: "10"
+      - key: RANK_REFRESH_SECONDS
+        value: "30"
       - key: MAX_SIMULTANEOUS_POSITIONS
         value: "3"
-      - key: MIN_24H_QUOTE_VOLUME
-        value: "5000000"
       - key: ENTRY_SCORE
-        value: "0.80"
-      - key: TAKE_PROFIT_PCT
-        value: "0.0025"
-      - key: STOP_LOSS_PCT
-        value: "0.0015"
-      - key: MAX_HOLD_SECONDS
-        value: "45"
+        value: "0.78"
+      - key: CHALLENGER_GAP
+        value: "0.06"
+      - key: MIN_24H_QUOTE_VOLUME
+        value: "1000000"
+      - key: MIN_1M_QUOTE_VOLUME
+        value: "50000"
       - key: MAX_SPREAD_BPS
-        value: "8"
+        value: "10"
       - key: ENTRY_COOLDOWN_SECONDS
+        value: "45"
+      - key: MAX_HOLD_SECONDS
+        value: "180"
+      - key: EST_FEE_BPS
+        value: "4"
+      - key: EST_SLIPPAGE_BPS
         value: "3"
       - key: DRY_RUN
         value: "true"
