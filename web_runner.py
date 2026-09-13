@@ -5,6 +5,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import hft_scalper_30s as engine
+import top_gainer_regime
+
+# Replace the BTC-only regime classifier with top-gainer breadth regime.
+engine.market_regime = lambda: top_gainer_regime.market_regime(engine)
 
 START_TIME = time.time()
 
@@ -34,6 +38,8 @@ def get_stats():
         'dry_run': True,
         'uptime_seconds': round(time.time() - START_TIME, 1),
         'regime': regime,
+        'regime_source': 'TOP_GAINERS',
+        'top_gainers_n': top_gainer_regime.TOP_GAINERS_N,
         'universe_ranked': len(ranked),
         'discovery_n': engine.DISCOVERY_N,
         'execution_n': engine.EXECUTION_N,
@@ -70,7 +76,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px s
 .pill{padding:5px 9px;border-radius:20px;background:#1d2736;font-size:12px}.section{margin-top:16px}.muted{color:#8996aa}.refresh{font-size:12px;color:#8996aa}
 @media(max-width:750px){.grid{grid-template-columns:repeat(2,1fr)}.value{font-size:22px}}
 </style></head><body><div class="wrap">
-<div class="bar"><div><h1>⚡ Binance 1m Alpha Engine</h1><div class="sub">Dynamic Meme Universe · 1-minute momentum · Paper Trading</div></div><div id="status" class="pill">CONNECTING</div></div>
+<div class="bar"><div><h1>⚡ Binance 1m Alpha Engine</h1><div class="sub">Dynamic Meme Universe · 1-minute momentum · Top-Gainer Regime · Paper Trading</div></div><div id="status" class="pill">CONNECTING</div></div>
 <div class="grid">
 <div class="card"><div class="label">Net P&L</div><div id="pnl" class="value">—</div></div>
 <div class="card"><div class="label">Win Rate</div><div id="win" class="value">—</div></div>
@@ -92,11 +98,11 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px s
 async function update(){try{let r=await fetch('/stats.json?x='+Date.now(),{cache:'no-store'});let d=await r.json();
 status.textContent=d.dry_run?'● 1m DRY RUN':'LIVE';status.className='pill';
 let p=d.net_pnl_pct;pnl.textContent=(p>=0?'+':'')+p.toFixed(4)+'%';pnl.className='value '+(p>=0?'good':'bad');
-win.textContent=d.win_rate_pct.toFixed(2)+'%';pf.textContent=d.profit_factor===null?'—':d.profit_factor.toFixed(3);regime.textContent=d.regime||'UNKNOWN';
+win.textContent=d.win_rate_pct.toFixed(2)+'%';pf.textContent=d.profit_factor===null?'—':d.profit_factor.toFixed(3);regime.textContent=(d.regime||'UNKNOWN')+' · '+(d.regime_source||'');
 entries.textContent=d.entries;exits.textContent=d.exits;open.textContent=d.open_positions;universe.textContent=d.universe_ranked+'/'+d.discovery_n;
 equity.textContent=d.equity.toFixed(2);dd.textContent=d.drawdown_pct.toFixed(3)+'%';signals.textContent=d.signals;bars.textContent=d.completed_bars;
 coins.innerHTML=(d.top_10||[]).map((s,i)=>'<tr><td>'+(i+1)+'</td><td><b>'+s+'</b></td></tr>').join('')||'<tr><td colspan="2" class="muted">No ranked symbols yet</td></tr>';
-activity.textContent='Engine: '+d.engine+' · Execution set: '+d.execution_n+' · Signals: '+d.signals+' · Market events: '+d.market_events+' · Completed 1m bars: '+d.completed_bars+' · Uptime: '+Math.round(d.uptime_seconds/60)+' min'+(d.trading_halted?' · TRADING HALTED':'');
+activity.textContent='Engine: '+d.engine+' · Regime source: '+d.regime_source+' ('+d.top_gainers_n+' gainers) · Execution set: '+d.execution_n+' · Signals: '+d.signals+' · Completed 1m bars: '+d.completed_bars+' · Uptime: '+Math.round(d.uptime_seconds/60)+' min'+(d.trading_halted?' · TRADING HALTED':'');
 }catch(e){status.textContent='OFFLINE';status.className='pill bad';}}
 update();setInterval(update,3000);
 </script></body></html>'''
@@ -111,6 +117,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                 'service': 'binance-1m-engine',
                 'engine': 'alpha-1m',
                 'dry_run': True,
+                'regime_source': 'TOP_GAINERS',
+                'top_gainers_n': top_gainer_regime.TOP_GAINERS_N,
             }
             self._json(payload)
         elif path == '/stats.json':
