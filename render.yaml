@@ -16,7 +16,7 @@ services:
       - key: BINANCE_WS_BASE_URL
         value: wss://fstream.binance.com/stream
       - key: DISCOVERY_N
-        value: "30"
+        value: "50"
       - key: EXECUTION_N
         value: "10"
       - key: RANK_REFRESH_SECONDS
