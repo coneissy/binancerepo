@@ -24,17 +24,17 @@ services:
       - key: MIN_24H_QUOTE_VOLUME
         value: "5000000"
       - key: ENTRY_SCORE
-        value: "0.60"
+        value: "0.45"
       - key: TAKE_PROFIT_PCT
-        value: "0.0025"
-      - key: STOP_LOSS_PCT
         value: "0.0015"
+      - key: STOP_LOSS_PCT
+        value: "0.0010"
       - key: MAX_HOLD_SECONDS
-        value: "45"
+        value: "15"
       - key: MAX_SPREAD_BPS
-        value: "8"
+        value: "12"
       - key: ENTRY_COOLDOWN_SECONDS
-        value: "3"
+        value: "0.50"
       - key: DRY_RUN
         value: "true"
       - key: LOG_LEVEL
