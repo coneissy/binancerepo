@@ -1,4 +1,9 @@
-"""Dry-run-first Binance USD-M Futures meme scalper with live new-listing subscriptions."""
+"""Dry-run-first Binance USD-M Futures meme momentum/microstructure scalper.
+
+Designed for paper testing. Live execution is intentionally disabled.
+The strategy favors fewer, higher-quality trades over churn and continuously
+refreshes the Binance meme universe so newly listed contracts can be detected.
+"""
 import json
 import logging
 import math
@@ -9,69 +14,71 @@ from collections import defaultdict, deque
 
 import requests
 import websocket
-from polymorph_ai import decide as polymorph_decide
 
 BASE = os.getenv("BINANCE_BASE_URL", "https://demo-fapi.binance.com")
 WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "0"))
-WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
-ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.30"))
-MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "5"))
-TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0008"))
-SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0012"))
-MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "8"))
-MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "0"))
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))
-COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "0.15"))
-STATE_LEN = int(os.getenv("STATE_LEN", "120"))
+WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "6")))
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "0"))  # 0 = all meme perpetuals
+MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1000000"))
+NEW_LISTING_WINDOW = float(os.getenv("NEW_LISTING_WINDOW_SECONDS", "1800"))
+NEW_LISTING_MIN_QV = float(os.getenv("NEW_LISTING_MIN_QUOTE_VOLUME", "150000"))
+LISTING_REFRESH_SECONDS = float(os.getenv("LISTING_REFRESH_SECONDS", "15"))
+
+# Signal quality: deliberately higher than the old 0.30 threshold.
+ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.68"))
+NEW_ENTRY_SCORE = float(os.getenv("NEW_LISTING_ENTRY_SCORE", "0.74"))
+MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "4"))
+NEW_MAX_POSITIONS = int(os.getenv("NEW_LISTING_MAX_POSITIONS", "1"))
+COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "8"))
+NEW_COOLDOWN = float(os.getenv("NEW_LISTING_COOLDOWN_SECONDS", "20"))
+
+# Execution-cost model. Trade only when the expected move has room to pay costs.
 FEE_PER_SIDE = float(os.getenv("FEE_PER_SIDE_PCT", "0.0004"))
 SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0001"))
-MIN_EDGE_MULT = float(os.getenv("MIN_EDGE_MULTIPLIER", "1.25"))
-TP_VOL_MULT = float(os.getenv("TP_VOL_MULTIPLIER", "2.0"))
-SL_VOL_MULT = float(os.getenv("SL_VOL_MULTIPLIER", "1.2"))
-MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.0008"))
-MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.0040"))
-MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.0008"))
-MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.0025"))
+MIN_EDGE_MULT = float(os.getenv("MIN_EDGE_MULTIPLIER", "1.8"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "8"))
+NEW_MAX_SPREAD_BPS = float(os.getenv("NEW_LISTING_MAX_SPREAD_BPS", "10"))
 
-NEW_LISTING_WINDOW = float(os.getenv("NEW_LISTING_WINDOW_SECONDS", "900"))
-NEW_LISTING_MIN_QV = float(os.getenv("NEW_LISTING_MIN_QUOTE_VOLUME", "250000"))
-NEW_LISTING_MIN_LIVE_NOTIONAL = float(os.getenv("NEW_LISTING_MIN_LIVE_NOTIONAL", "50000"))
-NEW_LISTING_SCORE = float(os.getenv("NEW_LISTING_ENTRY_SCORE", "0.42"))
-NEW_LISTING_TP = float(os.getenv("NEW_LISTING_TP_PCT", "0.0025"))
-NEW_LISTING_SL = float(os.getenv("NEW_LISTING_SL_PCT", "0.0018"))
-NEW_LISTING_HOLD = float(os.getenv("NEW_LISTING_MAX_HOLD_SECONDS", "20"))
-NEW_LISTING_COOLDOWN = float(os.getenv("NEW_LISTING_COOLDOWN_SECONDS", "1.0"))
-NEW_LISTING_MAX_POSITIONS = int(os.getenv("NEW_LISTING_MAX_POSITIONS", "2"))
-LISTING_REFRESH_SECONDS = float(os.getenv("LISTING_REFRESH_SECONDS", "15"))
+# Dynamic exits.
+MIN_TP = float(os.getenv("MIN_TP_PCT", "0.0018"))
+MAX_TP = float(os.getenv("MAX_TP_PCT", "0.0060"))
+MIN_SL = float(os.getenv("MIN_SL_PCT", "0.0012"))
+MAX_SL = float(os.getenv("MAX_SL_PCT", "0.0028"))
+TP_VOL_MULT = float(os.getenv("TP_VOL_MULTIPLIER", "3.0"))
+SL_VOL_MULT = float(os.getenv("SL_VOL_MULTIPLIER", "1.5"))
+MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "30"))
+NEW_MAX_HOLD = float(os.getenv("NEW_LISTING_MAX_HOLD_SECONDS", "25"))
+TRAIL_START = float(os.getenv("TRAIL_START_PCT", "0.0012"))
+TRAIL_GIVEBACK = float(os.getenv("TRAIL_GIVEBACK_PCT", "0.0009"))
+
+STATE_LEN = int(os.getenv("STATE_LEN", "180"))
+MIN_EVENTS = int(os.getenv("MIN_EVENTS", "30"))
 
 MEME_SYMBOLS = {
     "DOGE", "SHIB", "1000SHIB", "PEPE", "1000PEPE", "FLOKI", "BONK", "WIF",
     "MEME", "MEMES", "BRETT", "TURBO", "NEIRO", "1000NEIRO", "PNUT", "ACT", "GOAT",
-    "MOODENG", "MOO", "CHILLGUY", "POPCAT", "DOGS", "CAT", "MEW", "MYRO", "BOME",
-    "SLERF", "SUNDOG", "MOG", "PONKE", "WHY", "TOSHI", "BAN", "FARTCOIN", "ARC",
-    "JELLYJELLY", "PIPPIN", "SWARMS", "AVA", "AVAAI", "TRUMP", "MELANIA", "SPX",
-    "GIGA", "FWOG", "GOCHU", "BROCCOLI", "BABYDOGE", "1000BABYDOGE", "PUMP", "DOOD",
-    "ZEREBRO", "MOTHER", "RETARDIO",
+    "MOODENG", "CHILLGUY", "POPCAT", "DOGS", "CAT", "MEW", "MYRO", "BOME", "SLERF",
+    "SUNDOG", "MOG", "PONKE", "WHY", "TOSHI", "BAN", "FARTCOIN", "ARC", "JELLYJELLY",
+    "PIPPIN", "SWARMS", "AVA", "AVAAI", "TRUMP", "MELANIA", "SPX", "GIGA", "FWOG",
+    "BROCCOLI", "BABYDOGE", "1000BABYDOGE", "PUMP", "DOOD", "ZEREBRO", "MOTHER",
+    "RETARDIO", "PNUT", "1000BONK", "1000FLOKI", "1000CAT", "1000CHEEMS", "1000SATS",
 }
 MEME_PREFIXES = ("1000", "1M")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("hft-scalper")
+log = logging.getLogger("meme-scalper")
 http = requests.Session()
+
 state = {}
 quote_volume = {}
+first_seen = {}
+known_symbols = set()
 positions = {}
 last_entry = {}
-known_symbols = set()
-first_seen = {}
+confirmations = defaultdict(int)
 lock = threading.RLock()
-ws_lock = threading.RLock()
-ws_clients = {}
-shard_symbols = {}
-ws_request_id = 0
-metrics = {"events": 0, "signals": 0, "entries": 0, "exits": 0, "reconnects": 0, "no_book": 0, "short_state": 0, "spread_reject": 0, "vol_reject": 0, "score_reject": 0, "cost_reject": 0, "flow_reject": 0, "liquidity_reject": 0, "long_candidates": 0, "short_candidates": 0, "ai_boosts": 0, "cost_checks": 0, "new_listings": 0, "new_listing_entries": 0, "listing_refreshes": 0, "ws_subscriptions": 0, "ws_subscription_errors": 0}
+metrics = defaultdict(int)
 performance = defaultdict(lambda: {"trades": 0, "wins": 0, "losses": 0, "return": 0.0})
 
 
@@ -82,10 +89,17 @@ def public(path, params=None):
 
 
 def make_state():
-    return {"bid": 0.0, "ask": 0.0, "bq": 0.0, "aq": 0.0, "last": 0.0, "prices": deque(maxlen=STATE_LEN), "flow": deque(maxlen=STATE_LEN), "flow_abs": deque(maxlen=STATE_LEN), "last_event": 0.0}
+    return {
+        "bid": 0.0, "ask": 0.0, "bq": 0.0, "aq": 0.0, "last": 0.0,
+        "prices": deque(maxlen=STATE_LEN),
+        "flow": deque(maxlen=STATE_LEN),
+        "flow_abs": deque(maxlen=STATE_LEN),
+        "last_side": None,
+        "last_event": 0.0,
+    }
 
 
-def is_meme_symbol(symbol):
+def is_meme(symbol):
     base = symbol.upper().removesuffix("USDT")
     return base in MEME_SYMBOLS or base.startswith(MEME_PREFIXES)
 
@@ -94,65 +108,71 @@ def exchange_symbols():
     info = public("/fapi/v1/exchangeInfo")
     result = {}
     for x in info.get("symbols", []):
-        if x.get("status") != "TRADING" or x.get("contractType") != "PERPETUAL" or x.get("quoteAsset") != "USDT":
+        if x.get("status") != "TRADING":
             continue
-        result[x["symbol"].lower()] = {"onboard": int(x.get("onboardDate", 0) or 0), "pair": x.get("pair", "")}
+        if x.get("contractType") != "PERPETUAL" or x.get("quoteAsset") != "USDT":
+            continue
+        s = x["symbol"].lower()
+        result[s] = {"onboard": int(x.get("onboardDate", 0) or 0)}
     return result
 
 
-def discover_new_listings(symbol_meta, startup=False):
-    now = time.time()
-    fresh = []
-    for s, meta in symbol_meta.items():
-        if s in known_symbols:
-            continue
-        known_symbols.add(s)
-        onboard = meta.get("onboard", 0)
-        if onboard > 0:
-            age = max(0.0, now - onboard / 1000.0)
-            if age <= NEW_LISTING_WINDOW:
-                first_seen[s] = onboard / 1000.0
-        elif not startup:
-            first_seen[s] = now
-        fresh.append(s)
-        if not startup and is_meme_symbol(s):
-            metrics["new_listings"] += 1
-            log.warning("NEW MEME LISTING DETECTED | %s", s.upper())
-    return fresh
-
-
-def qv_allowed(s):
-    return quote_volume.get(s, 0.0) >= MIN_QV
-
-
-def universe():
+def refresh_universe(startup=False):
+    global known_symbols
     meta = exchange_symbols()
-    discover_new_listings(meta, startup=True)
+    now = time.time()
+    new_meme = []
+    for s, info in meta.items():
+        if s not in known_symbols:
+            known_symbols.add(s)
+            onboard = info.get("onboard", 0)
+            if onboard:
+                age = now - onboard / 1000.0
+                if age <= NEW_LISTING_WINDOW:
+                    first_seen[s] = onboard / 1000.0
+            elif not startup:
+                first_seen[s] = now
+            if not startup and is_meme(s):
+                new_meme.append(s)
+                metrics["new_listings"] += 1
+                log.warning("NEW MEME LISTING DETECTED | %s", s.upper())
+
     tickers = public("/fapi/v1/ticker/24hr")
     ranked = []
     for t in tickers:
-        s = t.get("symbol", "").lower()
-        if s not in meta or not is_meme_symbol(s):
+        s = str(t.get("symbol", "")).lower()
+        if s not in meta or not is_meme(s):
             continue
         try:
             qv = float(t.get("quoteVolume", 0) or 0)
             move = abs(float(t.get("priceChangePercent", 0) or 0)) / 100.0
             quote_volume[s] = qv
-            ranked.append((qv * max(move, 0.002), s))
-            if s in first_seen and time.time() - first_seen[s] <= NEW_LISTING_WINDOW and qv >= NEW_LISTING_MIN_QV:
-                log.warning("NEW LISTING ACTIVE | %s age=%.0fs qv=%.0f", s.upper(), time.time() - first_seen[s], qv)
+            is_new = s in first_seen and now - first_seen[s] <= NEW_LISTING_WINDOW
+            if qv >= (NEW_LISTING_MIN_QV if is_new else MIN_QV):
+                # Momentum x liquidity ranking, while retaining the complete meme universe.
+                ranked.append((qv * max(move, 0.002), s))
+                if is_new and qv >= NEW_LISTING_MIN_QV:
+                    log.warning("NEW LISTING ACTIVE | %s age=%.0fs qv=%.0f", s.upper(), now - first_seen[s], qv)
         except (TypeError, ValueError):
             continue
+
     ranked.sort(reverse=True)
-    selected = [s for _, s in ranked if qv_allowed(s)]
+    selected = [s for _, s in ranked]
     if UNIVERSE_SIZE > 0:
         selected = selected[:UNIVERSE_SIZE]
-    log.warning("MEME UNIVERSE | matched=%d selected=%d symbols=%s", len(ranked), len(selected), ",".join(x.upper() for x in selected))
+    for s in selected:
+        state.setdefault(s, make_state())
+    metrics["listing_refreshes"] += 1
+    log.warning("MEME UNIVERSE | matched=%d selected=%d new=%d", len(ranked), len(selected), len(new_meme))
     return selected
 
 
-def _clamp(x, lo=0.0, hi=1.0):
+def clamp(x, lo=0.0, hi=1.0):
     return min(max(x, lo), hi)
+
+
+def normalized_direction(x, scale):
+    return clamp(x / max(scale, 1e-12))
 
 
 def score_symbol(s):
@@ -160,89 +180,150 @@ def score_symbol(s):
     if not st or st["bid"] <= 0 or st["ask"] <= 0:
         metrics["no_book"] += 1
         return None
-    is_new = s in first_seen and time.time() - first_seen[s] <= NEW_LISTING_WINDOW
-    if not is_new and not qv_allowed(s):
-        metrics["liquidity_reject"] += 1
-        return None
-    live_notional = sum(st["flow_abs"])
-    if is_new and live_notional < NEW_LISTING_MIN_LIVE_NOTIONAL:
-        metrics["liquidity_reject"] += 1
-        return None
-    mid = (st["bid"] + st["ask"]) * 0.5
-    spread_bps = (st["ask"] - st["bid"]) / mid * 10000.0
-    ps, fs = st["prices"], st["flow"]
-    if spread_bps > MAX_SPREAD_BPS * (1.5 if is_new else 1.0):
-        metrics["spread_reject"] += 1
-        return None
-    if len(ps) < 8 or len(fs) < 10:
+    ps = list(st["prices"])
+    fs = list(st["flow"])
+    fa = list(st["flow_abs"])
+    if len(ps) < MIN_EVENTS or len(fs) < MIN_EVENTS:
         metrics["short_state"] += 1
         return None
+
+    now = time.time()
+    is_new = s in first_seen and now - first_seen[s] <= NEW_LISTING_WINDOW
+    qv = quote_volume.get(s, 0.0)
+    if qv < (NEW_LISTING_MIN_QV if is_new else MIN_QV):
+        metrics["liquidity_reject"] += 1
+        return None
+
+    mid = (st["bid"] + st["ask"]) * 0.5
+    spread_bps = (st["ask"] - st["bid"]) / max(mid, 1e-12) * 10000.0
+    spread_limit = NEW_MAX_SPREAD_BPS if is_new else MAX_SPREAD_BPS
+    if spread_bps > spread_limit:
+        metrics["spread_reject"] += 1
+        return None
+
+    # Three momentum horizons reduce one-tick noise.
+    m3 = ps[-1] / ps[-4] - 1.0
+    m8 = ps[-1] / ps[-9] - 1.0
+    m20 = ps[-1] / ps[-21] - 1.0 if len(ps) >= 21 else m8
+
+    recent = fs[-8:]
+    prior = fs[-24:-8]
+    recent_flow = sum(recent)
+    prior_abs = sum(abs(x) for x in prior) / max(len(prior), 1)
+    flow_ratio = recent_flow / max(prior_abs * len(recent), 1e-12)
+    flow_accel = (sum(recent[-4:]) - sum(recent[:4])) / max(prior_abs * 4.0, 1e-12)
+
     imbalance = (st["bq"] - st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
-    micro_edge = (micro - mid) / mid
-    momentum = ps[-1] / ps[-min(8, len(ps))] - 1.0
-    recent = list(fs)[-5:]
-    previous = list(fs)[-10:-5]
-    recent_flow, previous_flow = sum(recent), sum(previous)
-    previous_abs = sum(abs(x) for x in previous) / 5.0
-    flow_edge = recent_flow / max(previous_abs * 5.0, 1e-12)
-    directional_accel = (recent_flow - previous_flow) / max(previous_abs * 5.0, 1e-12)
-    returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 12), len(ps)) if ps[i - 1] > 0]
+    micro_edge = (micro - mid) / max(mid, 1e-12)
+
+    returns = []
+    for i in range(max(1, len(ps) - 20), len(ps)):
+        if ps[i - 1] > 0 and ps[i] > 0:
+            returns.append(math.log(ps[i] / ps[i - 1]))
     vol = math.sqrt(sum(r * r for r in returns) / max(len(returns), 1))
-    if vol < 0.00002 and not is_new:
+    if vol < 0.00003 and not is_new:
         metrics["vol_reject"] += 1
         return None
-    long_score = _clamp(imbalance) * 0.30 + _clamp(micro_edge / 0.0004) * 0.18 + _clamp(momentum / 0.0010) * 0.22 + _clamp(flow_edge / 1.5) * 0.18 + _clamp(directional_accel) * 0.12
-    short_score = _clamp(-imbalance) * 0.30 + _clamp(-micro_edge / 0.0004) * 0.18 + _clamp(-momentum / 0.0010) * 0.22 + _clamp(-flow_edge / 1.5) * 0.18 + _clamp(-directional_accel) * 0.12
-    side = "BUY" if long_score > short_score else "SELL"
-    signed_flow = flow_edge if side == "BUY" else -flow_edge
-    if signed_flow < -0.15:
-        metrics["flow_reject"] += 1
-        return None
+
+    # Directional components. Every component must broadly agree.
+    long_score = (
+        normalized_direction(imbalance, 0.65) * 0.22
+        + normalized_direction(micro_edge, 0.00045) * 0.14
+        + normalized_direction(m3, 0.0008) * 0.18
+        + normalized_direction(m8, 0.0012) * 0.18
+        + normalized_direction(m20, 0.0020) * 0.10
+        + normalized_direction(flow_ratio, 1.2) * 0.12
+        + normalized_direction(flow_accel, 1.0) * 0.06
+    )
+    short_score = (
+        normalized_direction(-imbalance, 0.65) * 0.22
+        + normalized_direction(-micro_edge, 0.00045) * 0.14
+        + normalized_direction(-m3, 0.0008) * 0.18
+        + normalized_direction(-m8, 0.0012) * 0.18
+        + normalized_direction(-m20, 0.0020) * 0.10
+        + normalized_direction(-flow_ratio, 1.2) * 0.12
+        + normalized_direction(-flow_accel, 1.0) * 0.06
+    )
+
+    side = "BUY" if long_score >= short_score else "SELL"
     score = max(long_score, short_score)
-    if len(ps) >= 15:
-        ai = polymorph_decide(s.upper(), list(ps)[-40:])
-        if ai.action == side:
-            score = min(1.0, score + (0.08 if ai.confidence >= 2 / 3 else 0.03))
-            metrics["ai_boosts"] += 1
-    threshold = NEW_LISTING_SCORE if is_new else ENTRY_SCORE
-    round_trip_cost = 2.0 * FEE_PER_SIDE + 2.0 * SLIPPAGE_PCT + spread_bps / 10000.0
-    projected_move = max(abs(momentum), abs(micro_edge) * 2.0, vol * (1.0 + score), abs(directional_accel) * vol)
-    expected_edge = projected_move * (0.50 + 0.75 * score) - round_trip_cost
-    metrics["cost_checks"] += 1
-    if expected_edge <= round_trip_cost * (MIN_EDGE_MULT - 1.0):
-        metrics["cost_reject"] += 1
+    signed_momentum = (m3 + m8 + m20) / 3.0 if side == "BUY" else -(m3 + m8 + m20) / 3.0
+    signed_flow = flow_ratio if side == "BUY" else -flow_ratio
+
+    # Avoid fading the tape: momentum and flow must point in the same direction.
+    if signed_momentum <= 0 or signed_flow < -0.10:
+        metrics["confirmation_reject"] += 1
+        confirmations[s] = 0
         return None
+
+    # Require two consecutive qualifying observations before entry.
+    threshold = NEW_ENTRY_SCORE if is_new else ENTRY_SCORE
     if score < threshold:
         metrics["score_reject"] += 1
-        metrics["long_candidates" if long_score >= short_score else "short_candidates"] += 1
+        confirmations[s] = 0
         return None
-    if is_new:
-        target, stop = NEW_LISTING_TP, NEW_LISTING_SL
-    else:
-        target = _clamp(max(MIN_TP_PCT, vol * TP_VOL_MULT, abs(momentum) * 1.5, TP_PCT), MIN_TP_PCT, MAX_TP_PCT)
-        stop = _clamp(max(MIN_SL_PCT, vol * SL_VOL_MULT, SL_PCT), MIN_SL_PCT, MAX_SL_PCT)
-        target = _clamp(target * (0.90 + 0.35 * score), MIN_TP_PCT, MAX_TP_PCT)
+    confirmations[s] += 1
+    if confirmations[s] < 2:
+        metrics["confirmation_wait"] += 1
+        return None
+
+    round_trip_cost = 2.0 * FEE_PER_SIDE + 2.0 * SLIPPAGE_PCT + spread_bps / 10000.0
+    projected_move = max(abs(m3), abs(m8) * 0.8, abs(m20) * 0.5, vol * (1.0 + score))
+    expected_edge = projected_move * (0.75 + 0.75 * score) - round_trip_cost
+    metrics["cost_checks"] += 1
+    if expected_edge < round_trip_cost * MIN_EDGE_MULT:
+        metrics["cost_reject"] += 1
+        confirmations[s] = 0
+        return None
+
+    target = clamp(max(MIN_TP, vol * TP_VOL_MULT, abs(m3) * 2.0), MIN_TP, MAX_TP)
+    stop = clamp(max(MIN_SL, vol * SL_VOL_MULT), MIN_SL, MAX_SL)
+    # Higher-quality signals get slightly more room for profit.
+    target = clamp(target * (0.95 + 0.35 * score), MIN_TP, MAX_TP)
     price = st["ask"] if side == "BUY" else st["bid"]
     return side, score, price, target, stop, expected_edge, is_new
 
 
-def enter(s, side, score, price, target, stop, expected_edge, is_new=False):
+def enter(s, signal):
+    side, score, price, target, stop, expected_edge, is_new = signal
     now = time.time()
     with lock:
         if s in positions or len(positions) >= MAX_POSITIONS:
             return
-        if is_new and sum(1 for p in positions.values() if p.get("new_listing")) >= NEW_LISTING_MAX_POSITIONS:
+        if is_new and sum(1 for p in positions.values() if p.get("new_listing")) >= NEW_MAX_POSITIONS:
             return
-        cooldown = NEW_LISTING_COOLDOWN if is_new else COOLDOWN
-        if now - last_entry.get(s, 0.0) < cooldown:
+        cd = NEW_COOLDOWN if is_new else COOLDOWN
+        if now - last_entry.get(s, 0.0) < cd:
             return
-        positions[s] = {"side": side, "entry": price, "opened": now, "score": score, "tp": target, "sl": stop, "expected_edge": expected_edge, "new_listing": is_new}
+        positions[s] = {
+            "side": side, "entry": price, "opened": now, "score": score,
+            "tp": target, "sl": stop, "expected_edge": expected_edge,
+            "new_listing": is_new, "peak": price, "trailing": False,
+        }
         last_entry[s] = now
+        confirmations[s] = 0
         metrics["entries"] += 1
         if is_new:
             metrics["new_listing_entries"] += 1
-    log.warning("ENTRY %s %s score=%.3f edge=%.3f%% tp=%.3f%% sl=%.3f%% price=%.10g%s [DRY RUN]", side, s.upper(), score, expected_edge * 100, target * 100, stop * 100, price, " NEW-LISTING-SNIPER" if is_new else "")
+    log.warning(
+        "ENTRY %s %s score=%.3f edge=%.3f%% tp=%.3f%% sl=%.3f%% spread-aware%s price=%.10g [DRY RUN]",
+        side, s.upper(), score, expected_edge * 100, target * 100, stop * 100,
+        " NEW-LISTING" if is_new else "", price,
+    )
+
+
+def exit_position(s, p, px, ret, reason, held):
+    metrics["exits"] += 1
+    bucket = "new" if p.get("new_listing") else "regular"
+    performance[bucket]["trades"] += 1
+    performance[bucket]["return"] += ret
+    if ret > 0:
+        performance[bucket]["wins"] += 1
+    else:
+        performance[bucket]["losses"] += 1
+    metrics[f"exit_{reason.lower()}"] += 1
+    log.warning("EXIT %s %s return=%.3f%% held=%.2fs", reason, s.upper(), ret * 100, held)
 
 
 def manage_positions():
@@ -257,18 +338,32 @@ def manage_positions():
             if px <= 0:
                 continue
             ret = px / p["entry"] - 1.0 if p["side"] == "BUY" else p["entry"] / px - 1.0
-            hold_limit = NEW_LISTING_HOLD if p.get("new_listing") else MAX_HOLD
-            reason = "TP" if ret >= p["tp"] else "SL" if ret <= -p["sl"] else "TIME" if now - p["opened"] >= hold_limit else None
+            held = now - p["opened"]
+            if p["side"] == "BUY":
+                p["peak"] = max(p["peak"], px)
+                drawdown = p["peak"] / px - 1.0
+            else:
+                p["peak"] = min(p["peak"], px)
+                drawdown = px / p["peak"] - 1.0
+
+            reason = None
+            if ret >= p["tp"]:
+                reason = "TP"
+            elif ret <= -p["sl"]:
+                reason = "SL"
+            elif ret >= TRAIL_START and drawdown >= TRAIL_GIVEBACK:
+                reason = "TRAIL"
+            elif held >= (NEW_MAX_HOLD if p.get("new_listing") else MAX_HOLD):
+                reason = "TIME"
+            else:
+                sig = score_symbol(s)
+                if sig and sig[0] != p["side"] and sig[1] >= (NEW_ENTRY_SCORE if p.get("new_listing") else ENTRY_SCORE):
+                    reason = "REVERSAL"
             if reason:
                 positions.pop(s, None)
-                metrics["exits"] += 1
-                perf = performance[s]
-                perf["trades"] += 1
-                perf["return"] += ret
-                perf["wins" if ret > 0 else "losses"] += 1
-                exits.append((s, p, px, ret, reason, now - p["opened"]))
-    for s, p, px, ret, reason, held in exits:
-        log.warning("EXIT %s %s return=%.3f%% held=%.2fs%s", reason, s.upper(), ret * 100, held, " NEW-LISTING" if p.get("new_listing") else "")
+                exits.append((s, p, px, ret, reason, held))
+    for row in exits:
+        exit_position(*row)
 
 
 def on_message(_, raw):
@@ -276,144 +371,127 @@ def on_message(_, raw):
         msg = json.loads(raw)
         d = msg.get("data", msg)
         event = d.get("e")
-        s = d.get("s", "").lower()
+        s = str(d.get("s", "")).lower()
         if not s or s not in state:
             return
+        st = state[s]
+        metrics["events"] += 1
         if event == "bookTicker":
-            with lock:
-                st = state[s]
-                st["bid"], st["ask"] = float(d["b"]), float(d["a"])
-                st["bq"], st["aq"] = float(d["B"]), float(d["A"])
-                st["last_event"] = time.time()
+            st["bid"] = float(d["b"])
+            st["ask"] = float(d["a"])
+            st["bq"] = float(d["B"])
+            st["aq"] = float(d["A"])
+            st["last_event"] = time.time()
         elif event == "aggTrade":
-            px, qty = float(d["p"]), float(d["q"])
-            signed = -px * qty if d.get("m") else px * qty
-            with lock:
-                st = state[s]
-                st["last"] = px
-                st["prices"].append(px)
-                st["flow"].append(signed)
-                st["flow_abs"].append(abs(signed))
-                st["last_event"] = time.time()
+            px = float(d["p"])
+            qty = float(d["q"])
+            notional = px * qty
+            signed = -notional if d.get("m") else notional
+            st["last"] = px
+            st["prices"].append(px)
+            st["flow"].append(signed)
+            st["flow_abs"].append(abs(signed))
+            st["last_event"] = time.time()
         else:
             return
-        metrics["events"] += 1
         sig = score_symbol(s)
         if sig:
             metrics["signals"] += 1
-            enter(s, *sig)
+            enter(s, sig)
     except Exception:
         log.exception("market-data message error")
 
 
-def _next_request_id():
-    global ws_request_id
-    with ws_lock:
-        ws_request_id += 1
-        return ws_request_id
-
-
-def _subscribe(ws, symbols, shard):
-    if not symbols or not ws or not ws.sock or not ws.sock.connected:
-        return False
-    params = []
+def stream_url(symbols):
+    streams = []
     for s in symbols:
-        params.extend((f"{s}@bookTicker", f"{s}@aggTrade"))
-    payload = {"method": "SUBSCRIBE", "params": params, "id": _next_request_id()}
-    try:
-        ws.send(json.dumps(payload))
-        metrics["ws_subscriptions"] += len(symbols)
-        log.info("WS SUBSCRIBE shard=%d symbols=%d", shard, len(symbols))
-        return True
-    except Exception:
-        metrics["ws_subscription_errors"] += 1
-        log.exception("WS subscription failed shard=%d", shard)
-        return False
+        streams.append(f"{s}@bookTicker")
+        streams.append(f"{s}@aggTrade")
+    return WS_BASE + "?streams=" + "/".join(streams)
 
 
-def _on_open(ws, shard):
-    _subscribe(ws, shard_symbols.get(shard, []), shard)
-
-
-def _on_error(_, error):
-    log.error("WS error: %s", error)
-
-
-def _on_close(_, code, msg):
-    log.warning("WS closed code=%s msg=%s", code, msg)
-
-
-def _run_shard(shard, symbols):
-    shard_symbols[shard] = list(symbols)
-    while True:
-        try:
-            ws = websocket.WebSocketApp(WS_BASE, on_open=lambda w: _on_open(w, shard), on_message=on_message, on_error=_on_error, on_close=_on_close)
-            with ws_lock:
-                ws_clients[shard] = ws
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception:
-            log.exception("WS shard %d crashed", shard)
-        metrics["reconnects"] += 1
-        time.sleep(1)
-
-
-def subscribe_new_symbols(symbols):
+def run_ws(symbols, shard_id):
     if not symbols:
         return
-    with ws_lock:
-        current = [set(shard_symbols.get(i, [])) for i in range(WS_SHARDS)]
-        for s in symbols:
-            if any(s in group for group in current):
-                continue
-            shard = min(range(WS_SHARDS), key=lambda i: len(current[i]))
-            shard_symbols.setdefault(shard, []).append(s)
-            current[shard].add(s)
-            ws = ws_clients.get(shard)
-            if ws:
-                _subscribe(ws, [s], shard)
-            state.setdefault(s, make_state())
-
-
-def listing_monitor():
+    url = stream_url(symbols)
     while True:
-        time.sleep(LISTING_REFRESH_SECONDS)
         try:
-            meta = exchange_symbols()
-            fresh = discover_new_listings(meta, startup=False)
-            fresh_meme = [s for s in fresh if is_meme_symbol(s)]
-            if fresh_meme:
-                subscribe_new_symbols(fresh_meme)
-            metrics["listing_refreshes"] += 1
+            log.info("WS shard %d connecting symbols=%d", shard_id, len(symbols))
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=lambda _, e: log.warning("WS shard %d error: %s", shard_id, e),
+                on_close=lambda _, c, m: log.warning("WS shard %d closed: %s %s", shard_id, c, m),
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception:
-            log.exception("listing monitor failed")
+            log.exception("WS shard %d failed", shard_id)
+        metrics["reconnects"] += 1
+        time.sleep(2)
 
 
-def stats_loop():
+def websocket_manager():
+    current = []
+    last_signature = None
     while True:
-        time.sleep(10)
+        try:
+            current = refresh_universe(startup=not known_symbols)
+            signature = tuple(current)
+            if signature != last_signature:
+                shards = [[] for _ in range(min(WS_SHARDS, max(1, len(current))))]
+                for i, s in enumerate(current):
+                    shards[i % len(shards)].append(s)
+                for i, shard in enumerate(shards, 1):
+                    threading.Thread(target=run_ws, args=(shard, i), daemon=True).start()
+                    metrics["ws_subscriptions"] += len(shard)
+                last_signature = signature
+        except Exception:
+            log.exception("universe refresh failed")
+        time.sleep(LISTING_REFRESH_SECONDS)
+
+
+def monitor():
+    while True:
         manage_positions()
-        total_return = sum(v["return"] for v in performance.values())
-        total_trades = sum(v["trades"] for v in performance.values())
-        wins = sum(v["wins"] for v in performance.values())
-        log.warning("STATS events=%d signals=%d entries=%d exits=%d trades=%d wins=%d return=%.3f%% positions=%d new_entries=%d rejects(score=%d cost=%d flow=%d spread=%d liq=%d vol=%d)", metrics["events"], metrics["signals"], metrics["entries"], metrics["exits"], total_trades, wins, total_return * 100, len(positions), metrics["new_listing_entries"], metrics["score_reject"], metrics["cost_reject"], metrics["flow_reject"], metrics["spread_reject"], metrics["liquidity_reject"], metrics["vol_reject"])
+        time.sleep(0.05)
+
+
+def print_stats():
+    total = metrics["entries"]
+    wins = performance["regular"]["wins"] + performance["new"]["wins"]
+    trades = performance["regular"]["trades"] + performance["new"]["trades"]
+    ret = performance["regular"]["return"] + performance["new"]["return"]
+    wr = wins / trades * 100.0 if trades else 0.0
+    log.warning(
+        "STATS events=%d signals=%d entries=%d exits=%d trades=%d wins=%d winrate=%.1f%% return=%.3f%% positions=%d new_entries=%d",
+        metrics["events"], metrics["signals"], total, metrics["exits"], trades, wins, wr, ret * 100,
+        len(positions), metrics["new_listing_entries"],
+    )
+    log.warning(
+        "REJECTS spread=%d score=%d cost=%d flow=%d vol=%d liquidity=%d short_state=%d confirm_wait=%d",
+        metrics["spread_reject"], metrics["score_reject"], metrics["cost_reject"],
+        metrics["confirmation_reject"], metrics["vol_reject"], metrics["liquidity_reject"],
+        metrics["short_state"], metrics["confirmation_wait"],
+    )
+    log.warning(
+        "EXITS TP=%d SL=%d TRAIL=%d TIME=%d REVERSAL=%d | regular trades=%d return=%.3f%% | new trades=%d return=%.3f%%",
+        metrics["exit_tp"], metrics["exit_sl"], metrics["exit_trail"], metrics["exit_time"], metrics["exit_reversal"],
+        performance["regular"]["trades"], performance["regular"]["return"] * 100,
+        performance["new"]["trades"], performance["new"]["return"] * 100,
+    )
 
 
 def main():
     if not DRY_RUN:
-        raise RuntimeError("Live execution is disabled in this engine. Keep DRY_RUN=true until paper results are validated.")
-    symbols = universe()
-    if not symbols:
-        raise RuntimeError("No matching meme USDT perpetuals found")
-    for s in symbols:
-        state[s] = make_state()
-    shards = [[] for _ in range(WS_SHARDS)]
-    for i, s in enumerate(symbols):
-        shards[i % WS_SHARDS].append(s)
-    for shard, group in enumerate(shards):
-        if group:
-            threading.Thread(target=_run_shard, args=(shard, group), daemon=True).start()
-    threading.Thread(target=listing_monitor, daemon=True).start()
-    threading.Thread(target=stats_loop, daemon=True).start()
-    log.warning("STARTED DRY-RUN | symbols=%d shards=%d max_positions=%d", len(symbols), WS_SHARDS, MAX_POSITIONS)
+        raise RuntimeError("Live execution is disabled. Keep DRY_RUN=true until paper results are validated.")
+    refresh_universe(startup=True)
+    threading.Thread(target=websocket_manager, name="universe-manager", daemon=True).start()
+    threading.Thread(target=monitor, name="exit-engine", daemon=True).start()
+    log.warning("ENGINE STARTED | dry_run=%s meme_universe=ALL new_listing_detection=ON", DRY_RUN)
     while True:
-        time.sleep(1)
+        time.sleep(10)
+        print_stats()
+
+
+if __name__ == "__main__":
+    main()
