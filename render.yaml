@@ -33,6 +33,8 @@ services:
         value: "4500"
       - key: MIN_FLOW_SCORE
         value: "0.47"
+      - key: TOP_GAINERS_N
+        value: "20"
       - key: TREND_SOFT_MOM
         value: "0.004"
       - key: TREND_SOFT_FLOW
