@@ -1,12 +1,47 @@
 """Top-gainer breadth regime for the 1m meme engine."""
 import os
+import time
 from statistics import median
 
 TOP_GAINERS_N=max(10,int(os.getenv("TOP_GAINERS_N","20")))
+REENTRY_COOLDOWN=float(os.getenv("REENTRY_COOLDOWN_SECONDS","300"))
+
+
+def install_symbol_guard(engine):
+    """Prevent the same symbol from being re-entered immediately after an exit."""
+    if getattr(engine,"_symbol_guard_installed",False):
+        return
+    cooldown={}
+    original_enter=engine.enter
+    original_manage=engine.manage
+
+    def guarded_enter(c):
+        s=c.get("symbol","")
+        until=cooldown.get(s,0.0)
+        if until>time.time():
+            return
+        if until:
+            cooldown.pop(s,None)
+        original_enter(c)
+
+    def guarded_manage():
+        before=set(engine.positions)
+        original_manage()
+        exited=before-set(engine.positions)
+        now=time.time()
+        for s in exited:
+            cooldown[s]=now+REENTRY_COOLDOWN
+            engine.log.info("SYMBOL COOLDOWN | %s | %ds",s.upper(),int(REENTRY_COOLDOWN))
+
+    engine.enter=guarded_enter
+    engine.manage=guarded_manage
+    engine._symbol_guard_installed=True
+    engine.log.info("SYMBOL DUPLICATE GUARD ON | cooldown=%ds",int(REENTRY_COOLDOWN))
 
 
 def market_regime(engine):
     """Classify regime from the current top 24h gainers using live 1m breadth."""
+    install_symbol_guard(engine)
     try:
         info=engine.api("/fapi/v1/exchangeInfo")
         ticks=engine.api("/fapi/v1/ticker/24hr")
