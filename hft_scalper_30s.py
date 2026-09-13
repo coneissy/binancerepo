@@ -24,11 +24,13 @@ WARMUP=max(20,int(os.getenv("WARMUP_BARS","25")))
 FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3"))
 MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","10")),EXECUTION_N); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","300"))
 RISK=float(os.getenv("BASE_RISK_PCT","0.002")); START=float(os.getenv("SIM_START_EQUITY","10000"))
+MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08"))
 MEME=("DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","MOG","TURBO","PNUT","GOAT","POPCAT","NEIRO","BOME","DOGS","CAT","PIG","TRUMP","MELANIA","BRETT","MOODENG","ACT","SPX","FWOG","DEGEN","TOSHI","MYRO","SUNDOG","BABY","WHY","MAGA","LADYS","PONKE","MEW","MICHI","ANDY","SLERF","MOTHER","GIGA","MUMU","PORK","COQ","KISHU","ELON","SAMO","BANANA","CATI","HMSTR","CHILLGUY","VINE","ANIME","PENGU","PONS","HAJIMI")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger("alpha-1m"); http=requests.Session(); lock=threading.RLock()
 hist={}; state={}; cache={}; ranked=[]; desired=[]; positions={}; last_entry={}; regime="UNKNOWN"
-metrics={"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"pnl":0.0}
+equity=START; peak_equity=START; trading_halted=False
+metrics={"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"pnl":0.0,"equity":START,"peak_equity":START,"drawdown":0.0,"trading_halted":False}
 
 
 def api(path,params=None):
@@ -177,26 +179,41 @@ def rank():
 
 
 def enter(c):
+    global trading_halted
     s=c["symbol"]; now=time.time(); z=st(s)
-    if not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<60:return
+    if trading_halted or not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<60:return
     px=z["ask"] if c["side"]=="BUY" else z["bid"]
     if px<=0:return
-    notional=START*RISK/max(c["atr"]*1.8,.0025); notional=min(notional,START*.30)
-    positions[s]={**c,"entry":px,"notional":notional,"opened":now}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("ALPHA ENTRY %s %s score=%.2f edge=%.0fbp rv=%.2f flow=%.2f [DRY RUN]",c["side"],s.upper(),c["score"],c["edge"],c["rv"],c["flow"])
+    stop=max(c["atr"]*1.8,.0025)
+    risk_cash=equity*RISK
+    notional=risk_cash/stop
+    notional=min(notional,equity*.30)
+    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
+    log.warning("ALPHA ENTRY %s %s score=%.2f edge=%.0fbp notional=%.2f equity=%.2f [DRY RUN]",c["side"],s.upper(),c["score"],c["edge"],notional,equity)
 
 
 def manage():
+    global equity,peak_equity,trading_halted
     for s,p in list(positions.items()):
         z=st(s); px=z["bid"] if p["side"]=="BUY" else z["ask"]
         if px<=0:continue
         ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1); stop=max(p["atr"]*1.8,.0025); target=stop*2.2
         reason="TARGET" if ret>=target else "STOP" if ret<=-stop else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
         if reason:
-            net=ret-2*(FEE+SLIP)/10000; metrics["pnl"]+=net; metrics["exits"]+=1
-            if net>=0:metrics["wins"]+=1
+            net=ret-2*(FEE+SLIP)/10000
+            cash_pnl=net*p["notional"]
+            equity+=cash_pnl
+            peak_equity=max(peak_equity,equity)
+            drawdown=max(0.0,(peak_equity-equity)/max(peak_equity,1e-9))
+            metrics["pnl"]+=cash_pnl; metrics["equity"]=equity; metrics["peak_equity"]=peak_equity; metrics["drawdown"]=drawdown
+            metrics["exits"]+=1
+            if cash_pnl>=0:metrics["wins"]+=1
             else:metrics["losses"]+=1
-            positions.pop(s,None); log.warning("ALPHA EXIT %s %s net=%.3f%%",reason,s.upper(),net*100)
+            positions.pop(s,None)
+            if drawdown>=MAX_DRAWDOWN and not trading_halted:
+                trading_halted=True; metrics["trading_halted"]=True
+                log.error("DRAWDOWN PROTECTION | equity=%.2f peak=%.2f drawdown=%.2f%% limit=%.2f%% | NEW ENTRIES HALTED",equity,peak_equity,drawdown*100,MAX_DRAWDOWN*100)
+            log.warning("ALPHA EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,drawdown*100)
 
 
 def on_message(ws,msg):
@@ -221,7 +238,7 @@ def ws_loop():
 
 def main():
     if not DRY_RUN:raise RuntimeError("LIVE EXECUTION DISABLED: DRY_RUN must remain true")
-    log.warning("1M ALPHA ENGINE START | discovery=%d execution=%d positions=%d | DRY_RUN=%s",DISCOVERY_N,EXECUTION_N,MAX_POS,DRY_RUN)
+    log.warning("1M ALPHA ENGINE START | discovery=%d execution=%d positions=%d | compounding=ON risk=%.3f%% max_dd=%.2f%% | DRY_RUN=%s",DISCOVERY_N,EXECUTION_N,MAX_POS,RISK*100,MAX_DRAWDOWN*100,DRY_RUN)
     threading.Thread(target=ws_loop,daemon=True).start(); last=0
     while True:
         now=time.time()
