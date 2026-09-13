@@ -1,4 +1,4 @@
-"""Dynamic meme-universe 30-second futures research engine. DRY RUN ONLY."""
+"""Dynamic Top-10 meme futures research engine. DRY RUN ONLY."""
 import json, logging, math, os, threading, time
 from collections import deque
 from statistics import mean
@@ -7,18 +7,25 @@ import requests, websocket
 BASE=os.getenv("BINANCE_BASE_URL","https://demo-fapi.binance.com")
 WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
 DRY_RUN=os.getenv("DRY_RUN","true").lower()=="true"
-TOP_N=int(os.getenv("TOP_N","50")); RANK_REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","30"))
-MAX_POSITIONS=int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","25")); MAX_SPREAD_BPS=float(os.getenv("MAX_SPREAD_BPS","12"))
-MIN_24H_QV=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN_30S_QV=float(os.getenv("MIN_30S_QUOTE_VOLUME","5000"))
-ENTRY_SCORE=float(os.getenv("ENTRY_SCORE","0.68")); MIN_EDGE_BPS=float(os.getenv("MIN_EDGE_BPS","8"))
+DISCOVERY_N=int(os.getenv("DISCOVERY_N","30")); EXECUTION_N=int(os.getenv("EXECUTION_N","10"))
+RANK_REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","30"))
+MAX_POSITIONS=int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","10"))
+MAX_SPREAD_BPS=float(os.getenv("MAX_SPREAD_BPS","10")); MIN_24H_QV=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN_30S_QV=float(os.getenv("MIN_30S_QUOTE_VOLUME","5000"))
+ENTRY_SCORE=float(os.getenv("ENTRY_SCORE","0.70")); MIN_EDGE_BPS=float(os.getenv("MIN_EDGE_BPS","8"))
 FEE_BPS=float(os.getenv("EST_FEE_BPS","4")); SLIPPAGE_BPS=float(os.getenv("EST_SLIPPAGE_BPS","3"))
 COOLDOWN=float(os.getenv("ENTRY_COOLDOWN_SECONDS","30")); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","180"))
 BAR_MS=30000; WARMUP_BARS=int(os.getenv("WARMUP_BARS","10"))
-MEME_HINTS=("DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","MOG","TURBO","PNUT","GOAT","POPCAT","NEIRO","BOME","DOGS","CAT","PIG","TRUMP","MELANIA","BRETT","MOODENG","ACT","SPX","FWOG","DEGEN","TOSHI","MYRO","SUNDOG","BABY","WHY","1000","MAGA","LADYS","SATS","ORDI","RATS","PONKE","MEW","MICHI","ANDY","SLERF","MOTHER","GIGA","RETARDIO","MUMU","PORK","COQ","KISHU","ELON","SAMO","NEIROETH","BANANA","CATI","HMSTR","CHILLGUY","VINE","ANIME")
+START_EQUITY=float(os.getenv("SIM_START_EQUITY","10000")); BASE_RISK=float(os.getenv("BASE_RISK_PCT","0.0025"))
+MAX_NOTIONAL=float(os.getenv("MAX_POSITION_NOTIONAL_X","0.50")); MAX_GROSS=float(os.getenv("MAX_GROSS_EXPOSURE_X","2.0"))
+MAX_SAME_SIDE=float(os.getenv("MAX_SAME_SIDE_EXPOSURE_X","1.25")); KELLY_FRACTION=float(os.getenv("KELLY_FRACTION","0.25"))
+DD_THROTTLE=float(os.getenv("DD_THROTTLE_PCT","0.10")); DD_STOP=float(os.getenv("DD_STOP_PCT","0.20"))
+VOL_CAP=float(os.getenv("VOL_CAP_PCT","0.012")); SHOCK_ATR=float(os.getenv("SHOCK_ATR_MULT","5.0"))
+MEME_HINTS=("DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","MOG","TURBO","PNUT","GOAT","POPCAT","NEIRO","BOME","DOGS","CAT","PIG","TRUMP","MELANIA","BRETT","MOODENG","ACT","SPX","FWOG","DEGEN","TOSHI","MYRO","SUNDOG","BABY","WHY","1000","MAGA","LADYS","SATS","ORDI","RATS","PONKE","MEW","MICHI","ANDY","SLERF","MOTHER","GIGA","RETARDIO","MUMU","PORK","COQ","KISHU","ELON","SAMO","NEIROETH","BANANA","CATI","HMSTR","CHILLGUY","VINE","ANIME","PENGU")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s")
-log=logging.getLogger("30s-engine"); http=requests.Session(); lock=threading.RLock()
-state={}; bars={}; bar_history={}; positions={}; last_entry={}; ranked=[]; desired_symbols=[]; market_regime="UNKNOWN"
-metrics={"events":0,"bars":0,"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"net_pnl":0.0,"gross_profit":0.0,"gross_loss":0.0}
+log=logging.getLogger("top10-engine"); http=requests.Session(); lock=threading.RLock()
+state={}; bars={}; bar_history={}; positions={}; last_entry={}; ranked=[]; desired_symbols=[]; market_regime="UNKNOWN"; kill_until=0.0; peak_equity=START_EQUITY
+metrics={"events":0,"bars":0,"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"net_pnl":0.0,"gross_profit":0.0,"gross_loss":0.0,"pyramids":0,"shock_kills":0}
+trade_history=deque(maxlen=100)
 
 def public(path,params=None):
     for i in range(3):
@@ -42,9 +49,6 @@ def rsi(xs,n=14):
 def sigmoid(x):
     x=max(-12,min(12,x)); return 1/(1+math.exp(-x))
 
-def is_meme(symbol):
-    b=symbol.upper().replace("USDT",""); return any(h in b for h in MEME_HINTS)
-
 def st(sym):
     return state.setdefault(sym,{"bid":0.0,"ask":0.0,"bq":0.0,"aq":0.0,"flow":deque(maxlen=240),"last":0.0})
 
@@ -56,7 +60,6 @@ def add_trade(sym,px,qty,buyer_maker,ts):
     else:
         b=old; b["h"]=max(b["h"],px); b["l"]=min(b["l"],px); b["c"]=px; b["v"]+=qty; b["qv"]+=q; b["buy"]+=q if not buyer_maker else 0.0; b["sell"]+=q if buyer_maker else 0.0; b["n"]+=1
     s["last"]=px; s["flow"].append(q if not buyer_maker else -q); metrics["events"]+=1
-
 
 def synthetic_features(sym):
     s=st(sym); b=bars.get(sym)
@@ -88,17 +91,17 @@ def higher(symbol):
 def universe():
     info=public("/fapi/v1/exchangeInfo"); meta={x["symbol"]:x for x in info["symbols"] if x.get("status")=="TRADING" and x.get("contractType")=="PERPETUAL" and x.get("quoteAsset")=="USDT"}; tickers={t.get("symbol"):t for t in public("/fapi/v1/ticker/24hr")}; now_ms=int(time.time()*1000); out=[]
     for s,m in meta.items():
-        if not is_meme(s):continue
         t=tickers.get(s,{})
         try:
-            q=float(t.get("quoteVolume",0)); ch=abs(float(t.get("priceChangePercent",0)))/100
-            if q<MIN_24H_QV:continue
-            age_days=(now_ms-int(m.get("onboardDate",now_ms)))/86400000 if m.get("onboardDate") else 9999
-            new_bonus=.18 if age_days<=7 else (.08 if age_days<=30 else 0.0)
-            radar=.42*min(ch/.10,1)+.28*min(math.log10(max(q,1))/8,1)+.20*min(q/20_000_000,1)+new_bonus
-            out.append((s.lower(),q,min(radar,1),age_days))
+            q=float(t.get("quoteVolume",0)); ch=abs(float(t.get("priceChangePercent",0)))/100; age_days=(now_ms-int(m.get("onboardDate",now_ms)))/86400000 if m.get("onboardDate") else 9999
+            if q<MIN_24H_QV and age_days>30: continue
+            b=s.upper().replace("USDT",""); hinted=any(h in b for h in MEME_HINTS)
+            new_bonus=.25 if age_days<=7 else (.12 if age_days<=30 else 0.0)
+            liquidity=min(math.log10(max(q,1))/8,1); momentum=min(ch/.10,1); radar=.38*momentum+.30*liquidity+.20*min(q/20_000_000,1)+new_bonus+(0.12 if hinted else 0.0)
+            if radar<.20 and not hinted: continue
+            out.append((s.lower(),q,min(radar,1),age_days,hinted))
         except (TypeError,ValueError):continue
-    out.sort(key=lambda x:(x[2],x[1]),reverse=True); return out[:max(TOP_N*3,120)]
+    out.sort(key=lambda x:(x[2],x[1]),reverse=True); return out[:max(DISCOVERY_N*3,90)]
 
 def global_regime():
     try:
@@ -110,10 +113,37 @@ def global_regime():
         return "CHOP"
     except Exception:return "UNKNOWN"
 
+def portfolio_pnl():
+    floating=0.0
+    for s,p in positions.items():
+        q=st(s); px=q["bid"] if p["side"]=="BUY" else q["ask"]
+        if px>0: floating += p.get("notional",0)*((px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1))
+    return START_EQUITY+metrics["net_pnl"]*START_EQUITY+floating
+
+def risk_multiplier():
+    global peak_equity
+    eq=portfolio_pnl(); peak_equity=max(peak_equity,eq); dd=max(0,1-eq/max(peak_equity,1e-9))
+    if dd>=DD_STOP:return 0.0
+    ddm=.5 if dd>=DD_THROTTLE else 1.0
+    return ddm
+
+def adaptive_size(c,risk):
+    # Fractional Kelly only; capped and further reduced for new listings/high volatility.
+    wr=mean(1.0 if x["net"]>0 else 0.0 for x in trade_history) if trade_history else .55
+    avg_win=mean(x["net"] for x in trade_history if x["net"]>0) if any(x["net"]>0 for x in trade_history) else .003
+    avg_loss=mean(abs(x["net"]) for x in trade_history if x["net"]<0) if any(x["net"]<0 for x in trade_history) else .0025
+    b=avg_win/max(avg_loss,1e-6); k=max(0,(wr*b-(1-wr))/max(b,1e-6))*KELLY_FRACTION
+    edge_factor=min(max(c["edge_bps"]/20,0.35),1.0); vol_factor=min(1.0, max(.15, VOL_CAP/max(c["atr"],1e-6)))
+    new_factor=.55 if c.get("new") else 1.0
+    score_factor=min(max((c["score"]-.60)/.30,.35),1.0)
+    risk_usd=START_EQUITY*BASE_RISK*max(k,.10)*risk*edge_factor*vol_factor*new_factor*score_factor
+    stop=max(c["atr"]*1.5,.0018); notional=risk_usd/stop
+    return min(notional,START_EQUITY*MAX_NOTIONAL)
+
 def rank():
     global ranked,desired_symbols,market_regime
     market_regime=global_regime(); cand=[]
-    for sym,q,radar,age_days in universe():
+    for sym,q,radar,age_days,hinted in universe():
         try:
             f=synthetic_features(sym); h=higher(sym)
             if not f or not h or f["spread"]>MAX_SPREAD_BPS or f["qv"]<MIN_30S_QV:continue
@@ -127,41 +157,69 @@ def rank():
             if market_regime=="RISK_ON" and side=="BUY":raw+=.10
             if market_regime=="RISK_OFF" and side=="SELL":raw+=.10
             score=sigmoid(raw-1.45)
-            cand.append({"symbol":sym,"side":side,"score":score,"edge_bps":edge,"spread":f["spread"],"atr":f["atr"],"rv":f["rv"],"flow":flow,"book":book,"accel":f["accel"],"momentum":f["ret3"],"rsi":f["rsi"],"regime":market_regime,"new":age_days<=7})
+            cand.append({"symbol":sym,"side":side,"score":score,"edge_bps":edge,"spread":f["spread"],"atr":f["atr"],"rv":f["rv"],"flow":flow,"book":book,"accel":f["accel"],"momentum":f["ret3"],"rsi":f["rsi"],"regime":market_regime,"new":age_days<=30,"age_days":age_days,"hinted":hinted})
         except Exception as e:log.debug("rank %s: %s",sym,e)
-    cand.sort(key=lambda x:(x["score"],x["edge_bps"]),reverse=True); ranked=cand[:TOP_N]; desired_symbols=[x["symbol"] for x in ranked]
-    log.info("MEME TOP-%d | MAX=%d | regime=%s | universe=%d | %s",TOP_N,MAX_POSITIONS,market_regime,len(cand)," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["edge_bps"]:.0f}bp/{x["side"]}' for x in ranked[:8]))
+    cand.sort(key=lambda x:(x["score"],x["edge_bps"]),reverse=True); ranked=cand[:DISCOVERY_N]; desired_symbols=[x["symbol"] for x in ranked[:EXECUTION_N]]
+    log.info("DYNAMIC TOP-%d | DISCOVERY=%d | MAX=%d | regime=%s | candidates=%d | %s",EXECUTION_N,DISCOVERY_N,MAX_POSITIONS,market_regime,len(cand)," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["edge_bps"]:.0f}bp/{x["side"]}' for x in ranked[:EXECUTION_N]))
 
 def confirm(c):
+    if time.time()<kill_until or risk_multiplier()<=0:return False
     if c["score"]<ENTRY_SCORE or c["edge_bps"]<MIN_EDGE_BPS or c["regime"]=="PANIC":return False
-    return c["rv"]>=1.15 and c["flow"]>=.12 and c["book"]>=.03 and abs(c["accel"])>=.00015 and c["spread"]<=MAX_SPREAD_BPS
+    if c["rv"]<1.15 or c["flow"]<.12 or c["book"]<.03 or abs(c["accel"])<.00015 or c["spread"]>MAX_SPREAD_BPS:return False
+    if c["atr"]>VOL_CAP:return False
+    return True
 
 def enter(c):
     s=c["symbol"]; now=time.time()
     with lock:
         if s in positions or len(positions)>=MAX_POSITIONS or now-last_entry.get(s,0)<COOLDOWN or not confirm(c):return
-        side_count=sum(1 for p in positions.values() if p["side"]==c["side"])
-        if side_count>=15:return
         q=st(s); px=q["ask"] if c["side"]=="BUY" else q["bid"]
         if px<=0:return
-        positions[s]={**c,"entry":px,"opened":now,"mfe":0.0,"mae":0.0}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("ENTRY 30S %s %s score=%.2f edge=%.0fbp flow=%.2f book=%.2f [DRY RUN]",c["side"],s.upper(),c["score"],c["edge_bps"],c["flow"],c["book"])
+        gross=sum(p.get("notional",0) for p in positions.values()); same=sum(p.get("notional",0) for p in positions.values() if p["side"]==c["side"])
+        mult=risk_multiplier(); notional=adaptive_size(c,mult)
+        if gross+notional>START_EQUITY*MAX_GROSS:notional=max(0,START_EQUITY*MAX_GROSS-gross)
+        if same+notional>START_EQUITY*MAX_SAME_SIDE:notional=max(0,START_EQUITY*MAX_SAME_SIDE-same)
+        if notional<=0:return
+        positions[s]={**c,"entry":px,"opened":now,"mfe":0.0,"mae":0.0,"notional":notional,"adds":0,"initial_notional":notional}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
+    log.warning("ENTRY %s %s score=%.2f edge=%.0fbp size=$%.0f new=%s regime=%s [DRY RUN]",c["side"],s.upper(),c["score"],c["edge_bps"],notional,c.get("new"),c["regime"])
 
 def close(s,p,ret,reason,age):
     net=ret-(FEE_BPS+SLIPPAGE_BPS)*2/10000; metrics["exits"]+=1; metrics["net_pnl"]+=net
+    trade_history.append({"net":net,"score":p.get("score",0),"reason":reason})
     if net>=0:metrics["wins"]+=1; metrics["gross_profit"]+=net
     else:metrics["losses"]+=1; metrics["gross_loss"]+=abs(net)
     pf=metrics["gross_profit"]/max(metrics["gross_loss"],1e-12); log.warning("EXIT %s %s net=%.3f%% held=%.1fs MFE=%.3f%% MAE=%.3f%% PF=%.2f",reason,s.upper(),net*100,age,p["mfe"]*100,p["mae"]*100,pf); positions.pop(s,None)
 
+def shock_check():
+    global kill_until
+    for s,p in list(positions.items()):
+        f=synthetic_features(s)
+        if not f:continue
+        ret=abs(f["ret1"]); atr=max(f["atr"],1e-6)
+        if ret>SHOCK_ATR*atr or (f["spread"]>MAX_SPREAD_BPS*2 and f["rv"]>3):
+            kill_until=time.time()+60; metrics["shock_kills"]+=1
+            for ss,pp in list(positions.items()):
+                q=st(ss); px=q["bid"] if pp["side"]=="BUY" else q["ask"]
+                if px>0:
+                    rr=(px/pp["entry"]-1)*(1 if pp["side"]=="BUY" else -1); close(ss,pp,rr,"TAIL_KILL",time.time()-pp["opened"])
+            log.warning("TAIL-RISK KILL SWITCH | symbol=%s ret=%.2f%% atr=%.2f%%",s.upper(),ret*100,atr*100); return
+
 def manage():
-    now=time.time()
+    shock_check(); now=time.time()
     for s,p in list(positions.items()):
         q=st(s); px=q["bid"] if p["side"]=="BUY" else q["ask"]
         if px<=0:continue
         ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1); age=now-p["opened"]; p["mfe"]=max(p["mfe"],ret); p["mae"]=min(p["mae"],ret); risk=max(p["atr"]*1.5,.0018); target=risk*2.7; f=synthetic_features(s); reason=None
         flow_flip=f and ((f["flow"]<-.08) if p["side"]=="BUY" else (f["flow"]>.08)); momentum_flip=f and ((f["ret1"]<0) if p["side"]=="BUY" else (f["ret1"]>0))
+        # Pyramid only winners; never add to a losing trade.
+        if ret>=risk and p["adds"]<2 and f and f["flow"]>.15 and f["rv"]>1.2:
+            add_size=p["initial_notional"]*(.50 if p["adds"]==0 else .25); gross=sum(x.get("notional",0) for x in positions.values())
+            if gross+add_size<=START_EQUITY*MAX_GROSS:
+                p["notional"]+=add_size; p["adds"]+=1; metrics["pyramids"]+=1; log.info("PYRAMID %s add=$%.0f level=%d",s.upper(),add_size,p["adds"])
+        # Breakeven after +1R; trailing after +2R.
         if ret<=-risk:reason="STOP"
         elif ret>=target:reason="2.7R"
+        elif ret>=risk and momentum_flip:reason="BREAKEVEN_DECAY"
         elif ret>=risk*.7 and flow_flip:reason="FLOW_TRAIL"
         elif ret>0 and momentum_flip and age>20:reason="MOMENTUM_DECAY"
         elif age>=MAX_HOLD:reason="TIME"
@@ -176,20 +234,25 @@ def on_message(ws,msg):
     except Exception as e:log.debug("ws message: %s",e)
 
 def ws_loop():
+    # Refresh the dynamic Top-10 subscription without waiting for a socket failure.
+    current=()
     while True:
         try:
-            syms=list(desired_symbols)
+            syms=tuple(desired_symbols)
             if not syms:time.sleep(2);continue
-            streams=[]
-            for s in syms:streams += [f"{s}@aggTrade",f"{s}@bookTicker"]
-            url=WS_BASE+"?streams="+"/".join(streams)
-            ws=websocket.WebSocketApp(url,on_message=on_message,on_error=lambda w,e:log.debug("ws error: %s",e),on_close=lambda w,c,m:log.info("ws reconnect"))
-            ws.run_forever(ping_interval=20,ping_timeout=10); time.sleep(1)
+            if syms!=current:
+                if current: log.info("WS universe changed: %s",", ".join(syms))
+                streams=[]
+                for s in syms:streams += [f"{s}@aggTrade",f"{s}@bookTicker"]
+                url=WS_BASE+"?streams="+"/".join(streams)
+                ws=websocket.WebSocketApp(url,on_message=on_message,on_error=lambda w,e:log.debug("ws error: %s",e),on_close=lambda w,c,m:log.info("ws reconnect"))
+                threading.Thread(target=ws.run_forever,kwargs={"ping_interval":20,"ping_timeout":10},daemon=True).start(); current=syms
+            time.sleep(2)
         except Exception as e:log.warning("ws loop: %s",e);time.sleep(2)
 
 def main():
     if not DRY_RUN:raise RuntimeError("Live execution is intentionally disabled; DRY_RUN must remain true")
-    log.warning("MEME-UNIVERSE START | TOP=%d | MAX=%d | DRY_RUN=%s | warmup=%d",TOP_N,MAX_POSITIONS,DRY_RUN,WARMUP_BARS)
+    log.warning("DYNAMIC TOP-10 START | DISCOVERY=%d | MAX=%d | DRY_RUN=%s | warmup=%d",DISCOVERY_N,MAX_POSITIONS,DRY_RUN,WARMUP_BARS)
     threading.Thread(target=ws_loop,daemon=True).start(); last_rank=0
     while True:
         now=time.time()
@@ -197,7 +260,7 @@ def main():
             try:rank()
             except Exception as e:log.exception("rank failed: %s",e)
             last_rank=now
-        for c in list(ranked):enter(c)
+        for c in list(ranked[:EXECUTION_N]):enter(c)
         manage();time.sleep(.25)
 
 if __name__=="__main__":main()
