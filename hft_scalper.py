@@ -1,8 +1,9 @@
 """Event-driven, dry-run-first Binance USD-M Futures scalper.
 
-HFT-inspired paper scalper with a transparent PolyMorph consensus enhancer.
-Market data is WebSocket-first; REST is used only during startup to build the
-liquid universe. Live execution remains disabled.
+Aggressive HFT-inspired paper scalper with a transparent PolyMorph enhancer.
+This is not exchange-colocated HFT. Market data is WebSocket-first; REST is
+used only during startup to build the liquid universe. Live execution remains
+disabled.
 """
 import json
 import logging
@@ -22,14 +23,14 @@ WS_BASE = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/stream")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "100"))
 WS_SHARDS = max(1, int(os.getenv("WS_SHARDS", "5")))
-ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.45"))
-MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
-TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0015"))
-SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0010"))
-MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "15"))
-MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "12"))
-COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "0.50"))
+ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "0.30"))
+MAX_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "5"))
+TP_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.0008"))
+SL_PCT = float(os.getenv("STOP_LOSS_PCT", "0.0012"))
+MAX_HOLD = float(os.getenv("MAX_HOLD_SECONDS", "8"))
+MIN_QV = float(os.getenv("MIN_24H_QUOTE_VOLUME", "3000000"))
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", "15"))
+COOLDOWN = float(os.getenv("ENTRY_COOLDOWN_SECONDS", "0.15"))
 STATE_LEN = int(os.getenv("STATE_LEN", "240"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -100,16 +101,18 @@ def score_symbol(s):
         return None
     ps = st["prices"]
     fs = st["flow"]
-    if len(ps) < 20 or len(fs) < 10:
+    # Short warm-up: begin scoring quickly instead of waiting for a long history.
+    if len(ps) < 12 or len(fs) < 6:
         metrics["short_state"] += 1
         return None
 
     imbalance = (st["bq"] - st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro = (st["ask"] * st["bq"] + st["bid"] * st["aq"]) / max(st["bq"] + st["aq"], 1e-12)
     micro_edge = (micro - mid) / mid
-    momentum = ps[-1] / ps[-8] - 1.0
-    recent_flow = sum(fs[-8:])
-    base_flow = sum(abs(x) for x in fs[-40:-8]) / max(len(fs[-40:-8]), 1)
+    momentum = ps[-1] / ps[-min(8, len(ps))] - 1.0
+    recent_flow = sum(fs[-6:])
+    base_slice = fs[-30:-6] if len(fs) > 6 else fs
+    base_flow = sum(abs(x) for x in base_slice) / max(len(base_slice), 1)
     flow_edge = recent_flow / max(base_flow, 1e-12)
     returns = [math.log(ps[i] / ps[i - 1]) for i in range(max(1, len(ps) - 20), len(ps)) if ps[i - 1] > 0]
     vol = math.sqrt(sum(r * r for r in returns) / max(len(returns), 1))
@@ -127,15 +130,15 @@ def score_symbol(s):
     long_score += min(long_flow / 2.0, 1.0) * 0.20
     short_score += min(short_flow / 2.0, 1.0) * 0.20
 
-    if vol < 0.00005:
+    # Only reject a truly dead market. Aggressive mode should trade active movement.
+    if vol < 0.00001:
         metrics["vol_reject"] += 1
         return None
 
     side = "BUY" if long_score > short_score else "SELL"
     score = max(long_score, short_score)
 
-    # PolyMorph is an enhancer, not a hard 2-of-3 gate. This deliberately
-    # favors frequency while requiring at least a modest microstructure edge.
+    # PolyMorph is a soft enhancer, never a hard gate.
     if len(ps) >= 30:
         ai = polymorph_decide(s.upper(), list(ps)[-60:])
         if ai.action == side and ai.confidence >= (2 / 3):
@@ -252,7 +255,7 @@ def run_ws(url, shard):
 def monitor():
     while True:
         manage_positions()
-        time.sleep(0.02)
+        time.sleep(0.01)
 
 
 def main():
