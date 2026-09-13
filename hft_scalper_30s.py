@@ -16,9 +16,12 @@ DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","30")))
 EXECUTION_N=max(10,int(os.getenv("EXECUTION_N","10")))
 REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","30"))
 MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","300000"))
-MIN1=float(os.getenv("MIN_1M_QUOTE_VOLUME","8000"))
-ENTRY=float(os.getenv("ENTRY_SCORE","0.66"))
+MIN1=float(os.getenv("MIN_1M_QUOTE_VOLUME","5000"))
+ENTRY=float(os.getenv("ENTRY_SCORE","0.60"))
 EDGE=float(os.getenv("MIN_EDGE_BPS","9"))
+FLOW_MIN=float(os.getenv("MIN_FLOW_SCORE","0.51"))
+TREND_SOFT_MOM=float(os.getenv("TREND_SOFT_MOM","0.004"))
+TREND_SOFT_FLOW=float(os.getenv("TREND_SOFT_FLOW","0.15"))
 MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","15"))
 WARMUP=max(20,int(os.getenv("WARMUP_BARS","25")))
 FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3"))
@@ -142,20 +145,23 @@ def score(s,radar,age,q,reject):
     if not h:reject["5m"]+=1; return None
     side=1 if f["ret"]>=0 else -1; sf=f["flow"]*side; sb=f["book"]*side
     impulse=max(0,min((f["rv"]-1)/1.5,1)); accel=max(0,min(abs(f["accel"])/.003,1)); flow=max(0,min((sf+1)/2,1)); book=max(0,min((sb+1)/2,1)); z=max(0,min(f["z"]/3,1)); br=1 if f["break"] else 0
-    trend=1 if ((h["e9"]>h["e21"])==bool(side>0)) else 0; mom=max(0,min(abs(h["mom"])/.01,1)) if ((h["mom"]*side)>0) else 0
+    trend=1 if ((h["e9"]>h["e21"])==bool(side>0)) else 0
+    trend_soft=(abs(h["mom"])>=TREND_SOFT_MOM and h["mom"]*side>0 and sf>=TREND_SOFT_FLOW and f["z"]>=1.0)
+    trend_ok=bool(trend or trend_soft)
+    mom=max(0,min(abs(h["mom"])/.01,1)) if ((h["mom"]*side)>0) else 0
     s=.25*impulse+.18*accel+.20*flow+.08*book+.10*z+.07*br+.07*trend+.05*mom
     if regime=="CHOP":s-=.06
     if regime=="PANIC":s-=.25
     if regime=="TREND_UP" and side>0:s+=.08
     if regime=="TREND_DOWN" and side<0:s+=.08
     s=max(0,min(1,s)); expected=max(abs(f["ret"])*18000,f["atr"]*20000,abs(f["ret5"])*12000); edge=expected-FEE-SLIP-f["spread"]
-    eligible=s>=ENTRY and edge>=EDGE and impulse>=.18 and flow>=.54 and trend and regime!="PANIC"
+    eligible=s>=ENTRY and edge>=EDGE and impulse>=.18 and flow>=FLOW_MIN and trend_ok and regime!="PANIC"
     if not eligible:
         if s<ENTRY:reject["score"]+=1
         elif edge<EDGE:reject["edge"]+=1
         elif impulse<.18:reject["impulse"]+=1
-        elif flow<.54:reject["flow"]+=1
-        elif not trend:reject["trend"]+=1
+        elif flow<FLOW_MIN:reject["flow"]+=1
+        elif not trend_ok:reject["trend"]+=1
         else:reject["regime"]+=1
     return {"symbol":s if False else s,"side":"BUY" if side>0 else "SELL","score":s,"edge":edge,"atr":f["atr"],"flow":sf,"book":sb,"z":f["z"],"rv":f["rv"],"ret":f["ret"],"eligible":eligible,"new":age<=7,"radar":radar}
 
