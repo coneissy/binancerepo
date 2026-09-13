@@ -24,13 +24,19 @@ services:
       - key: MAX_SIMULTANEOUS_POSITIONS
         value: "10"
       - key: ENTRY_SCORE
-        value: "0.66"
+        value: "0.60"
       - key: MIN_EDGE_BPS
         value: "9"
       - key: MIN_24H_QUOTE_VOLUME
         value: "300000"
       - key: MIN_1M_QUOTE_VOLUME
-        value: "8000"
+        value: "5000"
+      - key: MIN_FLOW_SCORE
+        value: "0.51"
+      - key: TREND_SOFT_MOM
+        value: "0.004"
+      - key: TREND_SOFT_FLOW
+        value: "0.15"
       - key: MAX_SPREAD_BPS
         value: "15"
       - key: WARMUP_BARS
