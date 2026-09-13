@@ -22,47 +22,49 @@ services:
       - key: RANK_REFRESH_SECONDS
         value: "30"
       - key: MAX_SIMULTANEOUS_POSITIONS
-        value: "10"
+        value: "8"
       - key: ENTRY_SCORE
-        value: "0.60"
-      - key: MIN_EDGE_BPS
-        value: "9"
+        value: "0.64"
       - key: MIN_24H_QUOTE_VOLUME
-        value: "300000"
-      - key: MIN_1M_QUOTE_VOLUME
-        value: "4500"
-      - key: MIN_FLOW_SCORE
-        value: "0.47"
-      - key: TOP_GAINERS_N
-        value: "20"
-      - key: TREND_SOFT_MOM
-        value: "0.004"
-      - key: TREND_SOFT_FLOW
-        value: "0.15"
+        value: "500000"
+      - key: MIN_3M_QUOTE_VOLUME
+        value: "12000"
       - key: MAX_SPREAD_BPS
-        value: "15"
+        value: "18"
       - key: WARMUP_BARS
-        value: "25"
+        value: "40"
       - key: MAX_HOLD_SECONDS
-        value: "300"
+        value: "900"
       - key: EST_FEE_BPS
         value: "4"
       - key: EST_SLIPPAGE_BPS
         value: "3"
       - key: BASE_RISK_PCT
-        value: "0.002"
+        value: "0.0025"
+      - key: SL_PCT
+        value: "0.01"
+      - key: TP_PCT
+        value: "0.02"
       - key: SIM_START_EQUITY
         value: "10000"
       - key: MAX_DRAWDOWN_PCT
         value: "0.08"
-      - key: TRAIL_ARM_PCT
-        value: "0.004"
-      - key: TRAIL_GAP_PCT
-        value: "0.0035"
-      - key: TRAIL_ATR_MULT
-        value: "1.15"
-      - key: MIN_ADAPT_TRADES
-        value: "3"
+      - key: BUILDIX_BASE_URL
+        value: https://www.buildix.trade/api/v1
+      - key: BUILDIX_API_KEY
+        sync: false
+      - key: BUILDIX_REFRESH_SECONDS
+        value: "60"
+      - key: BUILDIX_MAX_AGE_SECONDS
+        value: "180"
+      - key: BUILDIX_SIGNAL_WEIGHT
+        value: "0.12"
+      - key: BUILDIX_SMART_WEIGHT
+        value: "0.10"
+      - key: BUILDIX_MIN_SMART_COVERAGE
+        value: "5"
+      - key: BUILDIX_MIN_SIGNAL_SCORE
+        value: "20"
       - key: DRY_RUN
         value: "true"
       - key: LOG_LEVEL
