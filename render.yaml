@@ -30,9 +30,9 @@ services:
       - key: MIN_24H_QUOTE_VOLUME
         value: "300000"
       - key: MIN_1M_QUOTE_VOLUME
-        value: "5000"
+        value: "4500"
       - key: MIN_FLOW_SCORE
-        value: "0.51"
+        value: "0.47"
       - key: TREND_SOFT_MOM
         value: "0.004"
       - key: TREND_SOFT_FLOW
