@@ -55,6 +55,14 @@ services:
         value: "10000"
       - key: MAX_DRAWDOWN_PCT
         value: "0.08"
+      - key: TRAIL_ARM_PCT
+        value: "0.004"
+      - key: TRAIL_GAP_PCT
+        value: "0.0035"
+      - key: TRAIL_ATR_MULT
+        value: "1.15"
+      - key: MIN_ADAPT_TRADES
+        value: "3"
       - key: DRY_RUN
         value: "true"
       - key: LOG_LEVEL
