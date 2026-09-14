@@ -20,21 +20,21 @@ services:
       - key: EXECUTION_N
         value: "10"
       - key: RANK_REFRESH_SECONDS
-        value: "30"
+        value: "10"
       - key: MAX_SIMULTANEOUS_POSITIONS
-        value: "8"
+        value: "10"
       - key: ENTRY_SCORE
-        value: "0.64"
+        value: "0.48"
       - key: MIN_24H_QUOTE_VOLUME
-        value: "500000"
+        value: "300000"
       - key: MIN_3M_QUOTE_VOLUME
-        value: "12000"
+        value: "5000"
       - key: MAX_SPREAD_BPS
-        value: "18"
+        value: "28"
       - key: WARMUP_BARS
-        value: "40"
+        value: "30"
       - key: MAX_HOLD_SECONDS
-        value: "900"
+        value: "600"
       - key: EST_FEE_BPS
         value: "4"
       - key: EST_SLIPPAGE_BPS
@@ -45,6 +45,16 @@ services:
         value: "0.01"
       - key: TP_PCT
         value: "0.02"
+      - key: TRAIL_ACTIVATION_PCT
+        value: "0.003"
+      - key: TRAIL_NORMAL_PCT
+        value: "0.004"
+      - key: TRAIL_RISING_PCT
+        value: "0.0035"
+      - key: TRAIL_HIGH_PCT
+        value: "0.0025"
+      - key: TRAIL_ALERT_PCT
+        value: "0.002"
       - key: SIM_START_EQUITY
         value: "10000"
       - key: MAX_DRAWDOWN_PCT
