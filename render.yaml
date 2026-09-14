@@ -49,22 +49,6 @@ services:
         value: "10000"
       - key: MAX_DRAWDOWN_PCT
         value: "0.08"
-      - key: BUILDIX_BASE_URL
-        value: https://www.buildix.trade/api/v1
-      - key: BUILDIX_API_KEY
-        sync: false
-      - key: BUILDIX_REFRESH_SECONDS
-        value: "60"
-      - key: BUILDIX_MAX_AGE_SECONDS
-        value: "180"
-      - key: BUILDIX_SIGNAL_WEIGHT
-        value: "0.12"
-      - key: BUILDIX_SMART_WEIGHT
-        value: "0.10"
-      - key: BUILDIX_MIN_SMART_COVERAGE
-        value: "5"
-      - key: BUILDIX_MIN_SIGNAL_SCORE
-        value: "20"
       - key: DRY_RUN
         value: "true"
       - key: LOG_LEVEL
