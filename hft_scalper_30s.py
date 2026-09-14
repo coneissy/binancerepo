@@ -1,16 +1,24 @@
 """Buildix aggressive 3M paper scalper.
-15M context -> 5M trend -> 3M execution. Fast volatility opportunities, fixed risk, no martingale/doubling. Live execution remains disabled.
+15M context -> 5M trend -> 3M execution. Volatility-direct entries, fixed risk, adaptive trailing stop, no martingale/doubling. Live execution remains disabled.
 """
 import json, logging, math, os, threading, time
 from collections import deque
 from statistics import mean
 import requests, websocket
-BASE=os.getenv("BINANCE_BASE_URL","https://fapi.binance.com"); WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream"); DRY_RUN=True
-DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","50"))); EXECUTION_N=max(5,int(os.getenv("EXECUTION_N","10"))); REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","20"))
-MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","8000")); ENTRY=float(os.getenv("ENTRY_SCORE","0.52")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
-FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3")); MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","6")),EXECUTION_N); RISK=float(os.getenv("BASE_RISK_PCT","0.0025")); START=float(os.getenv("SIM_START_EQUITY","10000")); MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08")); SL_PCT=float(os.getenv("SL_PCT","0.01")); TP_PCT=float(os.getenv("TP_PCT","0.02")); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","600"))
+
+BASE=os.getenv("BINANCE_BASE_URL","https://fapi.binance.com")
+WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
+DRY_RUN=True
+DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","50"))); EXECUTION_N=max(5,int(os.getenv("EXECUTION_N","10")))
+REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","20")); MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","8000"))
+ENTRY=float(os.getenv("ENTRY_SCORE","0.52")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
+FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3")); MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","6")),EXECUTION_N)
+RISK=float(os.getenv("BASE_RISK_PCT","0.0025")); START=float(os.getenv("SIM_START_EQUITY","10000")); MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08"))
+SL_PCT=float(os.getenv("SL_PCT","0.01")); TP_PCT=float(os.getenv("TP_PCT","0.02")); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","600"))
+TRAIL_ACT=float(os.getenv("TRAIL_ACTIVATION_PCT","0.005")); TRAIL_NORMAL=float(os.getenv("TRAIL_NORMAL_PCT","0.006")); TRAIL_RISING=float(os.getenv("TRAIL_RISING_PCT","0.005")); TRAIL_HIGH=float(os.getenv("TRAIL_HIGH_PCT","0.004")); TRAIL_ALERT=float(os.getenv("TRAIL_ALERT_PCT","0.003"))
 MEME=("DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","MOG","TURBO","PNUT","GOAT","POPCAT","NEIRO","BOME","DOGS","CAT","PIG","TRUMP","MELANIA","BRETT","MOODENG","ACT","SPX","FWOG","DEGEN","TOSHI","MYRO","SUNDOG","BABY","WHY","MAGA","LADYS","PONKE","MEW","MICHI","ANDY","SLERF","MOTHER","GIGA","MUMU","PORK","COQ","KISHU","ELON","SAMO","BANANA","CATI","HMSTR","CHILLGUY","VINE","ANIME","PENGU","HAJIMI")
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s"); log=logging.getLogger("cryptoalpha-3m"); http=requests.Session(); lock=threading.RLock()
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s")
+log=logging.getLogger("cryptoalpha-3m"); http=requests.Session(); lock=threading.RLock()
 hist={}; state={}; cache={}; ranked=[]; desired=[]; positions={}; last_entry={}; regime="UNKNOWN"; equity=START; peak_equity=START; trading_halted=False
 metrics={"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"pnl":0.0,"equity":START,"peak_equity":START,"drawdown":0.0,"trading_halted":False}
 
@@ -98,14 +106,21 @@ def score(s,radar,age,q,reject):
     long_bias=r["bull15"] or r["bull5"]; short_bias=r["bear15"] or r["bear5"]; long_trigger=f["sweep_long"] or f["bos_long"] or f["bull_fvg"]; short_trigger=f["sweep_short"] or f["bos_short"] or f["bear_fvg"]; sf=f["flow"]
     long_score=.34*int(long_bias)+.20*int(long_trigger)+.14*int(f["displacement"])+.12*int(f["near_low"])+.10*max(0,min((sf+1)/2,1))+.10*f["volatility"]+.06*radar
     short_score=.34*int(short_bias)+.20*int(short_trigger)+.14*int(f["displacement"])+.12*int(f["near_high"])+.10*max(0,min((-sf+1)/2,1))+.10*f["volatility"]+.06*radar
+    # Volatility-direct mode: a strong expansion can create an entry even without a full ICT trigger.
+    direct_long=f["volatility"]>=.50 and x["c"]>x["o"] and (f["flow"]>=-.10 or radar>=.45)
+    direct_short=f["volatility"]>=.50 and x["c"]<x["o"] and (f["flow"]<=.10 or radar>=.45)
     if not long_bias and not short_bias:
-        long_score=.18*int(x["c"]>x["o"])+.24*int(long_trigger)+.20*f["volatility"]+.20*max(0,min((sf+1)/2,1))+.18*radar; short_score=.18*int(x["c"]<x["o"])+.24*int(short_trigger)+.20*f["volatility"]+.20*max(0,min((-sf+1)/2,1))+.18*radar
+        long_score=.18*int(x["c"]>x["o"])+.24*int(long_trigger)+.20*f["volatility"]+.20*max(0,min((sf+1)/2,1))+.18*radar
+        short_score=.18*int(x["c"]<x["o"])+.24*int(short_trigger)+.20*f["volatility"]+.20*max(0,min((-sf+1)/2,1))+.18*radar
+    if direct_long: long_score=max(long_score,.53+.18*f["volatility"]+.08*radar)
+    if direct_short: short_score=max(short_score,.53+.18*f["volatility"]+.08*radar)
     side=1 if long_score>=short_score and long_score>=ENTRY else -1 if short_score>long_score and short_score>=ENTRY else 0
     if side==0:
         reject["ict"]+=1; return {"symbol":"","side":"BUY" if long_score>short_score else "SELL" if short_score>long_score else "NEUTRAL","score":max(long_score,short_score),"edge":0.0,"atr":f["atr"],"flow":sf,"eligible":False,"new":age<=7,"radar":radar,"ict":False,"volatility":f["volatility"],"volatility_label":f["volatility_label"]}
-    scorev=long_score if side>0 else short_score; sf_dir=sf*side; edge=TP_PCT*10000-(2*(FEE+SLIP)+f["spread"]); eligible=scorev>=ENTRY and edge>=10 and sf_dir>=-0.15 and (f["volatility"]>=.22 or radar>=.30 or f["displacement"])
+    scorev=long_score if side>0 else short_score; sf_dir=sf*side; edge=TP_PCT*10000-(2*(FEE+SLIP)+f["spread"]); direct=(direct_long if side>0 else direct_short)
+    eligible=scorev>=ENTRY and edge>=10 and sf_dir>=-0.15 and (direct or f["volatility"]>=.22 or radar>=.30 or f["displacement"])
     if not eligible:reject["quality"]+=1
-    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"new":age<=7,"radar":radar,"ict":True,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT","volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
+    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"new":age<=7,"radar":radar,"ict":True,"volatility_direct":direct,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT","volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
 
 def rank():
     global ranked,desired,regime
@@ -129,15 +144,25 @@ def enter(c):
     px=z["ask"] if c["side"]=="BUY" else z["bid"]
     if px<=0:return
     risk_cash=equity*RISK; notional=min(risk_cash/SL_PCT,equity*.30)
-    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("BUILDIX ENTRY %s %s score=%.2f VOL=%s/%d%% radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],c.get("volatility_label"),round(c.get("volatility",0)*100),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
+    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT,"peak":px,"trailing":False,"trail_stop":None}
+    last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
+    log.warning("BUILDIX ENTRY %s %s score=%.2f VOL=%s/%d%% DIRECT=%s radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% TRAIL=ON FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],c.get("volatility_label"),round(c.get("volatility",0)*100),c.get("volatility_direct",False),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
+
+def trail_config(label):
+    return {"NORMAL":TRAIL_NORMAL,"RISING":TRAIL_RISING,"HIGH":TRAIL_HIGH,"ALERT":TRAIL_ALERT}.get(label,TRAIL_NORMAL)
 
 def manage():
     global equity,peak_equity,trading_halted
     for s,p in list(positions.items()):
         z=st(s); px=z["bid"] if p["side"]=="BUY" else z["ask"]
         if px<=0:continue
-        ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1); reason="TARGET_2R" if ret>=TP_PCT else "STOP_1PCT" if ret<=-SL_PCT else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
+        ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1)
+        if p["side"]=="BUY": p["peak"]=max(p["peak"],px)
+        else: p["peak"]=min(p["peak"],px)
+        if ret>=TRAIL_ACT:
+            p["trailing"]=True; dist=trail_config(p.get("volatility_label","NORMAL")); p["trail_stop"]=p["peak"]*(1-dist) if p["side"]=="BUY" else p["peak"]*(1+dist)
+        trail_hit=p["trailing"] and ((p["side"]=="BUY" and px<=p["trail_stop"]) or (p["side"]=="SELL" and px>=p["trail_stop"]))
+        reason="TRAIL_VOLATILITY" if trail_hit else "TARGET_2R" if ret>=TP_PCT else "STOP_1PCT" if ret<=-SL_PCT else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
         if reason:
             net=ret-2*(FEE+SLIP)/10000; cash_pnl=net*p["notional"]; equity+=cash_pnl; peak_equity=max(peak_equity,equity); dd=max(0,(peak_equity-equity)/max(peak_equity,1e-9)); metrics.update(pnl=metrics["pnl"]+cash_pnl,equity=equity,peak_equity=peak_equity,drawdown=dd,exits=metrics["exits"]+1); metrics["wins"]+=int(cash_pnl>=0); metrics["losses"]+=int(cash_pnl<0); positions.pop(s,None)
             if dd>=MAX_DRAWDOWN:trading_halted=True;metrics["trading_halted"]=True
@@ -160,7 +185,7 @@ def ws_loop():
         except Exception as e:log.warning("WS reconnect: %s",e);time.sleep(2)
 
 def main():
-    log.warning("BUILDIX AGGRESSIVE 3M START | VOLATILITY RADAR | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",RISK*100,SL_PCT*100,TP_PCT*100)
+    log.warning("BUILDIX AGGRESSIVE 3M START | VOLATILITY DIRECT | ADAPTIVE TRAILING | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",RISK*100,SL_PCT*100,TP_PCT*100)
     threading.Thread(target=ws_loop,daemon=True).start(); last=0
     while True:
         now=time.time()
