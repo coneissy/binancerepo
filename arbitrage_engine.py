@@ -15,22 +15,21 @@ FUNDING_BPS=float(os.getenv("ARB_FUNDING_BUFFER_BPS","1"))
 MIN_VOL=float(os.getenv("ARB_MIN_QUOTE_VOLUME","1000000"))
 MIN_DEPTH=float(os.getenv("ARB_MIN_DEPTH_USDT","500"))
 MAX_OPPS=max(10,int(os.getenv("ARB_MAX_OPPORTUNITIES","50")))
+MAX_ENTRIES_PER_SCAN=max(1,int(os.getenv("ARB_MAX_ENTRIES_PER_SCAN","50")))
 START=float(os.getenv("SIM_START_EQUITY","10000"))
 BASE_RISK=min(.01,max(.0005,float(os.getenv("ARB_RISK_PCT","0.0025"))))
-ENTRY_MULTIPLIER=max(1.0,float(os.getenv("ARB_ENTRY_MULTIPLIER","10")))
+ENTRY_MULTIPLIER=max(1.0,float(os.getenv("ARB_ENTRY_MULTIPLIER","1")))
 EFFECTIVE_RISK=BASE_RISK*ENTRY_MULTIPLIER
 MAX_DD=min(.25,max(.02,float(os.getenv("ARB_MAX_DRAWDOWN_PCT","0.08"))))
-COOLDOWN=float(os.getenv("ARB_COOLDOWN_SECONDS","5"))
 TIMEOUT=5
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger("cryptoalpha-arb")
-http=requests.Session();http.headers.update({"User-Agent":"Cryptoalpha-Arbitrage/2.0"})
+http=requests.Session();http.headers.update({"User-Agent":"Cryptoalpha-Arbitrage/3.0"})
 lock=threading.RLock()
 state={"started":time.time(),"scans":0,"errors":0,"last_scan":0.0,"last_error":"","opportunities":[],"best":None,
-       "equity":START,"peak":START,"paper_entries":0,"paper_pnl":0.0,"wins":0,"losses":0,"halted":False,
-       "seen":{},"last_capture":{},"captures_last_scan":0}
+       "equity":START,"peak":START,"paper_entries":0,"paper_pnl":0.0,"wins":0,"losses":0,"halted":False,"captures_last_scan":0}
 SPOT_FALLBACK=[SPOT,"https://api1.binance.com","https://api2.binance.com"]
-FUT_FALLBACK=[FUT,"https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
+FUT_FALLBACK=[FUT,"https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"]
 
 def get_any(bases,path,params=None):
     last=None
@@ -80,25 +79,20 @@ def paper_capture(opps):
         if state["halted"]:return
         e=state["equity"];p=state["peak"]
         if p and (p-e)/p>=MAX_DD:state["halted"]=True;return
-    # More entries: evaluate the strongest qualified opportunities, not just #1.
-    for best in opps[:min(10,len(opps))]:
-        key=best["symbol"]+":"+best["direction"]
+    # Repeat qualified opportunities every scan. There is intentionally no per-symbol
+    # cooldown or persistence gate in this paper stress-test mode.
+    for best in opps[:min(MAX_ENTRIES_PER_SCAN,len(opps))]:
         with lock:
-            prev=state["seen"].get(key);state["seen"][key]=now
-            last=state["last_capture"].get(key,0)
-            e=state["equity"];p=state["peak"]
-        # Require persistence across scans, but allow many independent opportunities.
-        if prev is None or now-prev>REFRESH*4 or now-last<COOLDOWN:continue
-        # 10x entry size is explicit position sizing, not martingale: every entry
-        # uses the same multiplier from the same base risk and never increases after a loss.
+            e=state["equity"]
         base_notional=e*BASE_RISK
         notional=max(100,min(base_notional*ENTRY_MULTIPLIER,max(best["depth_usdt"]*.10,100)))
         pnl=notional*(best["net_bps"]/10000)
         with lock:
+            if state["halted"]:break
             state["equity"]+=pnl;state["peak"]=max(state["peak"],state["equity"]);state["paper_pnl"]+=pnl
-            state["paper_entries"]+=1;state["wins"]+=1;state["last_capture"][key]=now
+            state["paper_entries"]+=1;state["wins"]+=1
         captures+=1
-        log.info("PAPER ARB | %s | %s | net=%.2f bps | 10X_NOTIONAL=$%.2f | simulated_pnl=$%.4f",best["symbol"],best["direction"],best["net_bps"],notional,pnl)
+        log.info("PAPER ARB REPEAT | %s | %s | net=%.2f bps | notional=$%.2f | simulated_pnl=$%.4f",best["symbol"],best["direction"],best["net_bps"],notional,pnl)
     with lock:state["captures_last_scan"]=captures
 
 def scan():
@@ -107,7 +101,7 @@ def scan():
         with lock:
             state["scans"]+=1;state["last_scan"]=time.time();state["last_error"]="";state["opportunities"]=opps[:MAX_OPPS];state["best"]=opps[0] if opps else None
         paper_capture(opps)
-        log.info("ARB SCAN | opportunities=%d | best_net=%.2f bps | captures=%d | 10x=%s | halted=%s",len(opps),opps[0]["net_bps"] if opps else 0,state["captures_last_scan"],ENTRY_MULTIPLIER,state["halted"])
+        log.info("ARB SCAN | opportunities=%d | best_net=%.2f bps | repeated_entries=%d | halted=%s",len(opps),opps[0]["net_bps"] if opps else 0,state["captures_last_scan"],state["halted"])
     except Exception as e:
         with lock:state["errors"]+=1;state["last_error"]=str(e)
         log.warning("ARB SCAN FAILED | %s",e)
@@ -121,9 +115,10 @@ def stats():
         return {"status":"ok","engine":"cryptoalpha-arbitrage","mode":"PAPER_ONLY","live_execution":False,"uptime_seconds":round(time.time()-state["started"],1),"refresh_seconds":REFRESH,
                 "scans":state["scans"],"errors":state["errors"],"last_scan":state["last_scan"],"last_error":state["last_error"],"opportunities":len(o),"best":best,"top_opportunities":o,"min_net_bps":MIN_NET_BPS,
                 "cost_model":{"fee_bps_per_leg":FEE_BPS,"slippage_bps_per_leg":SLIP_BPS,"funding_buffer_bps":FUNDING_BPS},"base_risk_pct":BASE_RISK*100,"entry_multiplier":ENTRY_MULTIPLIER,"effective_risk_pct":EFFECTIVE_RISK*100,
-                "equity":round(e,2),"peak_equity":round(p,2),"drawdown_pct":round(max(0,(p-e)/p)*100,4),"max_drawdown_pct":MAX_DD*100,"paper_entries":state["paper_entries"],"paper_pnl_pct":round(state["paper_pnl"]/START*100,4),"wins":state["wins"],"losses":state["losses"],"halted":state["halted"]}
+                "max_entries_per_scan":MAX_ENTRIES_PER_SCAN,"repeat_mode":True,"equity":round(e,2),"peak_equity":round(p,2),"drawdown_pct":round(max(0,(p-e)/p)*100,4),"max_drawdown_pct":MAX_DD*100,
+                "paper_entries":state["paper_entries"],"paper_pnl_pct":round(state["paper_pnl"]/START*100,4),"wins":state["wins"],"losses":state["losses"],"halted":state["halted"]}
 
-HTML="""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>Cryptoalpha Arbitrage</title><style>body{margin:0;background:#080b12;color:#e8edf5;font:14px system-ui}.w{max-width:1200px;margin:auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center}.brand{font-size:26px;font-weight:800}.pill{padding:7px 11px;border:1px solid #31533e;border-radius:20px}.g{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0}.c{background:#10151f;border:1px solid #202938;border-radius:12px;padding:14px}.l{font-size:11px;color:#8e9aae;text-transform:uppercase}.v{font-size:22px;font-weight:800;margin-top:5px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #202938;text-align:left}th{color:#8e9aae}@media(max-width:800px){.g{grid-template-columns:repeat(2,1fr)}}@media(max-width:500px){.g{grid-template-columns:1fr}}</style><div class=w><div class=top><div><div class=brand>Cryptoalpha Arbitrage</div><div>High-frequency executable-edge paper engine</div></div><div class=pill>PAPER ONLY · LIVE OFF</div></div><div class=g><div class=c><div class=l>Best net edge</div><div class=v id=b>—</div></div><div class=c><div class=l>Opportunities</div><div class=v id=o>—</div></div><div class=c><div class=l>Scans</div><div class=v id=s>—</div></div><div class=c><div class=l>Equity</div><div class=v id=e>—</div></div><div class=c><div class=l>Drawdown</div><div class=v id=d>—</div></div></div><div class=c><b>Entry engine</b><p>Entry threshold <b id=m>—</b> · base risk <b id=r>—</b> · <b id=x>10x</b> position multiplier · max DD <b id=q>—</b> · no doubling.</p></div><div class=c><b>Top executable opportunities</b><div id=t>Scanning…</div></div><div class=c><b>System</b><p id=z>—</p></div></div><script>const $=i=>document.getElementById(i),n=(v,d=2)=>Number(v||0).toFixed(d);async function u(){try{let d=await(await fetch('/stats.json?'+Date.now(),{cache:'no-store'})).json();$('b').textContent=d.best?n(d.best.net_bps)+' bps':'—';$('o').textContent=d.opportunities;$('s').textContent=d.scans;$('e').textContent='$'+n(d.equity);$('d').textContent=n(d.drawdown_pct,3)+'%';$('m').textContent=n(d.min_net_bps)+' bps';$('r').textContent=n(d.base_risk_pct,3)+'%';$('x').textContent=n(d.entry_multiplier,0)+'x';$('q').textContent=n(d.max_drawdown_pct,1)+'%';$('z').textContent='Uptime '+n(d.uptime_seconds,0)+'s · errors '+d.errors+' · paper entries '+d.paper_entries+(d.halted?' · HALTED':'');let q=(d.top_opportunities||[]).map((x,i)=>'<tr><td>'+(i+1)+'</td><td>'+x.symbol+'</td><td>'+x.direction+'</td><td>'+n(x.gross_bps)+'</td><td>'+n(x.net_bps)+'</td><td>$'+n(x.depth_usdt,0)+'</td><td>'+n(x.confidence*100,1)+'%</td></tr>').join('');$('t').innerHTML=q?'<table><tr><th>#</th><th>Market</th><th>Direction</th><th>Gross</th><th>Net</th><th>Depth</th><th>Confidence</th></tr>'+q+'</table>':'No qualified opportunities.'}catch(e){$('z').textContent='OFFLINE '+e}}u();setInterval(u,2000)</script>"""
+HTML="""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>Cryptoalpha Arbitrage</title><style>body{margin:0;background:#080b12;color:#e8edf5;font:14px system-ui}.w{max-width:1200px;margin:auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center}.brand{font-size:26px;font-weight:800}.pill{padding:7px 11px;border:1px solid #31533e;border-radius:20px}.g{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0}.c{background:#10151f;border:1px solid #202938;border-radius:12px;padding:14px}.l{font-size:11px;color:#8e9aae;text-transform:uppercase}.v{font-size:22px;font-weight:800;margin-top:5px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #202938;text-align:left}th{color:#8e9aae}@media(max-width:800px){.g{grid-template-columns:repeat(2,1fr)}}@media(max-width:500px){.g{grid-template-columns:1fr}}</style><div class=w><div class=top><div><div class=brand>Cryptoalpha Arbitrage</div><div>High-frequency repeated-entry paper engine</div></div><div class=pill>PAPER ONLY · LIVE OFF</div></div><div class=g><div class=c><div class=l>Best net edge</div><div class=v id=b>—</div></div><div class=c><div class=l>Opportunities</div><div class=v id=o>—</div></div><div class=c><div class=l>Scans</div><div class=v id=s>—</div></div><div class=c><div class=l>Paper entries</div><div class=v id=e>—</div></div><div class=c><div class=l>Drawdown</div><div class=v id=d>—</div></div></div><div class=c><b>Entry engine</b><p>Net threshold <b id=m>—</b> · repeated every scan · up to <b id=r>—</b> entries/scan · fixed sizing · no martingale · max DD <b id=q>—</b>.</p></div><div class=c><b>Top executable opportunities</b><div id=t>Scanning…</div></div><div class=c><b>System</b><p id=z>—</p></div></div><script>const $=i=>document.getElementById(i),n=(v,d=2)=>Number(v||0).toFixed(d);async function u(){try{let d=await(await fetch('/stats.json?'+Date.now(),{cache:'no-store'})).json();$('b').textContent=d.best?n(d.best.net_bps)+' bps':'—';$('o').textContent=d.opportunities;$('s').textContent=d.scans;$('e').textContent=d.paper_entries;$('d').textContent=n(d.drawdown_pct,3)+'%';$('m').textContent=n(d.min_net_bps)+' bps';$('r').textContent=d.max_entries_per_scan;$('q').textContent=n(d.max_drawdown_pct,1)+'%';$('z').textContent='Uptime '+n(d.uptime_seconds,0)+'s · errors '+d.errors+' · paper P&L '+n(d.paper_pnl_pct,3)+'% · last scan entries '+(d.max_entries_per_scan);let q=(d.top_opportunities||[]).map((x,i)=>'<tr><td>'+(i+1)+'</td><td>'+x.symbol+'</td><td>'+x.direction+'</td><td>'+n(x.gross_bps)+'</td><td>'+n(x.net_bps)+'</td><td>$'+n(x.depth_usdt,0)+'</td><td>'+n(x.confidence*100,1)+'%</td></tr>').join('');$('t').innerHTML=q?'<table><tr><th>#</th><th>Market</th><th>Direction</th><th>Gross</th><th>Net</th><th>Depth</th><th>Confidence</th></tr>'+q+'</table>':'No qualified opportunities.'}catch(e){$('z').textContent='OFFLINE '+e}}u();setInterval(u,2000)</script>"""
 class H(BaseHTTPRequestHandler):
  def j(self,o):
   raw=json.dumps(o,separators=(',',':'),default=str).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
@@ -138,5 +133,5 @@ class H(BaseHTTPRequestHandler):
 
 def main():
  threading.Thread(target=loop,name='arb-scanner',daemon=True).start()
- port=int(os.getenv('PORT','10000'));log.info('Cryptoalpha Arbitrage dashboard :%d | PAPER ONLY | 10X ENTRY MODE',port);ThreadingHTTPServer(('0.0.0.0',port),H).serve_forever()
+ port=int(os.getenv('PORT','10000'));log.info('Cryptoalpha Arbitrage dashboard :%d | PAPER ONLY | REPEAT ENTRY MODE',port);ThreadingHTTPServer(('0.0.0.0',port),H).serve_forever()
 if __name__=='__main__':main()
