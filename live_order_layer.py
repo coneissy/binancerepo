@@ -6,9 +6,11 @@ BASE = os.getenv("BINANCE_API_BASE", os.getenv("BINANCE_BASE_URL", "https://api.
 API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 LIVE = os.getenv("LIVE_TRADING", "false").lower() in {"1", "true", "yes", "on"}
+ARMED = os.getenv("LIVE_ARMED", "false").lower() in {"1", "true", "yes", "on"}
 STARTING_BALANCE = max(0.0, float(os.getenv("LIVE_STARTING_BALANCE_USDT", "30")))
 RISK_PCT = min(0.01, max(0.0005, float(os.getenv("ARB_RISK_PCT", "0.01"))))
 STATIC_MAX_NOTIONAL = max(0.0, float(os.getenv("MAX_LIVE_NOTIONAL_USDT", "0")))
+MAX_SESSION_LOSS_USDT = max(0.0, float(os.getenv("MAX_LIVE_SESSION_LOSS_USDT", str(max(0.01, STARTING_BALANCE * RISK_PCT)))))
 MIN_NET_BPS = max(0.0, float(os.getenv("ARB_MIN_NET_BPS", "3")))
 RECV_WINDOW = min(60000, max(1000, int(os.getenv("BINANCE_RECV_WINDOW", "5000"))))
 COOLDOWN_MS = max(1000, int(os.getenv("LIVE_ORDER_COOLDOWN_MS", "5000")))
@@ -39,7 +41,7 @@ def _signed(method, path, params):
     query = urllib.parse.urlencode(params, doseq=True)
     signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request(BASE + path + "?" + query + "&signature=" + signature, method=method,
-                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/6"})
+                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/7"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -69,20 +71,20 @@ def _check_auth(force=False):
     return _auth_ok
 
 def enabled():
-    if not LIVE or _live_halted:
+    if not LIVE or not ARMED or _live_halted:
         return False
     return _check_auth()
 
 def auth_status():
     _check_auth()
-    return {"configured": bool(API_KEY and API_SECRET), "live_trading": LIVE, "authenticated": _auth_ok,
-            "base_url": BASE, "error": _auth_error}
+    return {"configured": bool(API_KEY and API_SECRET), "live_trading": LIVE, "live_armed": ARMED,
+            "authenticated": _auth_ok, "base_url": BASE, "error": _auth_error}
 
 def circuit_status():
     return {"halted": _live_halted, "session_loss_usdt": round(_session_loss_usdt, 8),
-            "risk_pct": RISK_PCT * 100,
+            "max_session_loss_usdt": round(MAX_SESSION_LOSS_USDT, 8), "risk_pct": RISK_PCT * 100,
             "fallback_risk_budget_usdt": round(STARTING_BALANCE * RISK_PCT, 8),
-            "remaining_fallback_risk_usdt": round(max(0.0, STARTING_BALANCE * RISK_PCT - _session_loss_usdt), 8)}
+            "remaining_fallback_risk_usdt": round(max(0.0, MAX_SESSION_LOSS_USDT - _session_loss_usdt), 8)}
 
 def _trip(reason):
     global _live_halted
@@ -94,6 +96,8 @@ def record_realized_pnl(pnl_usdt):
     pnl = float(pnl_usdt)
     if pnl < 0:
         _session_loss_usdt += -pnl
+        if MAX_SESSION_LOSS_USDT > 0 and _session_loss_usdt >= MAX_SESSION_LOSS_USDT:
+            _trip("maximum live session loss reached")
     return circuit_status()
 
 def account():
@@ -105,7 +109,7 @@ def account():
 
 def exchange_info(symbols):
     qs = urllib.parse.urlencode({"symbols": json.dumps(symbols, separators=(",", ":"))})
-    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/6"})
+    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/7"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -133,22 +137,28 @@ def _round_down(value, step):
 
 def market_order(symbol, side, quantity):
     if not enabled():
-        raise LiveOrderError("LIVE_TRADING disabled, authentication failed, or circuit breaker halted")
+        raise LiveOrderError("LIVE_TRADING/LIVE_ARMED disabled, authentication failed, or circuit breaker halted")
     return _signed("POST", "/api/v3/order", {"symbol": symbol, "side": side, "type": "MARKET",
                                                 "quantity": ("%.12f" % quantity).rstrip("0").rstrip("."),
                                                 "newOrderRespType": "FULL"})
 
 def _filled_qty(order):
+    status = str(order.get("status", "")).upper()
+    if status != "FILLED":
+        raise LiveOrderError(f"order not fully filled: status={status or 'UNKNOWN'}")
     fills = order.get("fills") or []
     q = sum(float(x.get("qty", 0) or 0) for x in fills)
     if q > 0:
         return q
-    return float(order.get("executedQty", 0) or 0)
+    q = float(order.get("executedQty", 0) or 0)
+    if q <= 0:
+        raise LiveOrderError("filled order returned zero executed quantity")
+    return q
 
 def execute_spot_triangle(opportunity, books):
     global _last_order_ms
     if not enabled():
-        return {"executed": False, "reason": "Binance private authentication is not ready"}
+        return {"executed": False, "reason": "Binance private authentication, LIVE_TRADING, or LIVE_ARMED is not ready"}
     if float(opportunity.get("net_bps", 0)) < MIN_NET_BPS:
         return {"executed": False, "reason": "net bps below threshold"}
     now = int(time.time() * 1000)
@@ -158,18 +168,14 @@ def execute_spot_triangle(opportunity, books):
     if len(parts) != 4 or parts[0] != "USDT" or parts[-1] != "USDT":
         return {"executed": False, "reason": "invalid triangle path"}
     first, second = parts[1], parts[2]
-    # The monitored cross pair is first+second (base=first, quote=second).
-    # Forward: USDT -> first -> second -> USDT = BUY, SELL, SELL.
-    # Reverse: USDT -> second -> first -> USDT = BUY, BUY, SELL.
     forward = opportunity.get("path") == f"USDT->{first}->{second}->USDT"
     if forward:
         symbols = [first + "USDT", first + second, second + "USDT"]
         sides = ["BUY", "SELL", "SELL"]
-        books_used = [books.get(symbols[0]), books.get(symbols[1]), books.get(symbols[2])]
     else:
         symbols = [second + "USDT", first + second, first + "USDT"]
         sides = ["BUY", "BUY", "SELL"]
-        books_used = [books.get(symbols[0]), books.get(symbols[1]), books.get(symbols[2])]
+    books_used = [books.get(s) for s in symbols]
     if any(not x for x in books_used):
         return {"executed": False, "reason": "missing live quote"}
     info = exchange_info(symbols)
@@ -178,15 +184,14 @@ def execute_spot_triangle(opportunity, books):
     usdt = next((float(x.get("free", 0) or 0) for x in acct.get("balances", []) if x.get("asset") == "USDT"), 0.0)
     risk_budget = usdt * RISK_PCT
     minimum_notional = max((_min_notional(filters[s]) for s in symbols), default=0.0)
-    target_notional = max(risk_budget, minimum_notional)
+    notional = risk_budget
     if STATIC_MAX_NOTIONAL > 0:
-        target_notional = min(target_notional, STATIC_MAX_NOTIONAL)
-    notional = min(target_notional, usdt)
+        notional = min(notional, STATIC_MAX_NOTIONAL)
     if notional <= 0:
         return {"executed": False, "reason": "no available Binance USDT balance", "binance_free_usdt": usdt,
                 "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget}
     if minimum_notional and notional < minimum_notional:
-        return {"executed": False, "reason": f"Binance minimum notional {minimum_notional} exceeds free USDT balance {usdt:.8f}",
+        return {"executed": False, "reason": f"risk-sized notional {notional:.8f} is below Binance minimum notional {minimum_notional:.8f}",
                 "binance_free_usdt": usdt, "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget,
                 "minimum_notional": minimum_notional}
     first_book = books_used[0]
@@ -200,12 +205,9 @@ def execute_spot_triangle(opportunity, books):
     try:
         orders.append(market_order(symbols[0], sides[0], first_qty))
         first_filled = _filled_qty(orders[-1])
-        if first_filled <= 0:
-            raise LiveOrderError("first leg returned no filled quantity")
         if sides[1] == "SELL":
             second_qty = first_filled
         else:
-            # BUY first+second: spend the second asset received from leg 1.
             second_ask = float(books_used[1][1])
             second_step = _step(filters[symbols[1]])
             second_qty = _round_down(first_filled / second_ask, second_step)
@@ -213,10 +215,9 @@ def execute_spot_triangle(opportunity, books):
                 raise LiveOrderError("second leg quantity below market lot size")
         orders.append(market_order(symbols[1], sides[1], second_qty))
         second_filled = _filled_qty(orders[-1])
-        if second_filled <= 0:
-            raise LiveOrderError("second leg returned no filled quantity")
         orders.append(market_order(symbols[2], sides[2], second_filled))
-        return {"executed": True, "orders": orders, "notional_usdt": notional,
+        third_filled = _filled_qty(orders[-1])
+        return {"executed": True, "orders": orders, "final_filled_qty": third_filled, "notional_usdt": notional,
                 "binance_free_usdt": usdt, "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget,
                 "binance_min_notional_usdt": minimum_notional, "path": opportunity.get("path"),
                 "circuit_breaker": circuit_status()}
