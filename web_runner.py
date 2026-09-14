@@ -41,6 +41,85 @@ def _api_failover(path, params=None):
 
 engine.api = _api_failover
 
+# --- HTF freshness / REST-load guard ---------------------------------------
+# The old core only seeded 5M/15M once. That made HTF context stale while 3M
+# bars continued live. Refresh only the small execution candidate set instead
+# of repeatedly fetching candles for the whole discovery universe.
+_FRAME_AT = {}
+_FRAME_LOCK = threading.RLock()
+_FRAME_REFRESH = {"3m": 0.0, "5m": 90.0, "15m": 240.0}
+_ORIGINAL_SEED = engine.seed
+
+def _fresh_seed(symbol, interval, limit=100, force=False):
+    now = time.time()
+    key = (symbol, interval)
+    with _FRAME_LOCK:
+        due = force or interval == "3m" or now - _FRAME_AT.get(key, 0.0) >= _FRAME_REFRESH[interval]
+        if not due and interval in engine.hist.get(symbol, {}):
+            return True
+    try:
+        ok = _ORIGINAL_SEED(symbol, interval, limit)
+        if ok:
+            with _FRAME_LOCK:
+                _FRAME_AT[key] = time.time()
+        return ok
+    except Exception as exc:
+        engine.log.warning("FRAME REFRESH FAILED | %s %s | %s", symbol.upper(), interval, exc)
+        return interval in engine.hist.get(symbol, {})
+
+def _ensure_frames(symbol):
+    # 3M is live-updated by aggTrade; seed only when a symbol first enters the
+    # execution set.  5M/15M are periodically refreshed to keep HTF context
+    # current without hammering Binance.
+    for interval in ("3m", "5m", "15m"):
+        if not _fresh_seed(symbol, interval, 100):
+            return False
+    return True
+
+engine.ensure_frames = _ensure_frames
+
+# Rank only the highest-radar discovery candidates. This preserves a dynamic
+# broad universe while limiting expensive candle/indicator work to the actual
+# execution shortlist.
+def _optimized_rank():
+    d = engine.discover()
+    reject = {"warmup":0,"structure":0,"spread":0,"volume":0,"ict":0,"quality":0,"exception":0}
+    # Discovery already returns radar-sorted candidates. Inspect a little more
+    # than the execution count so a few weak setups do not empty the board.
+    inspect_n = max(engine.EXECUTION_N, min(len(d), engine.EXECUTION_N + 5))
+    pool = d[:inspect_n]
+    cand = []
+    for s, radar, age, q in pool:
+        try:
+            c = engine.score(s, radar, age, q, reject)
+            if c:
+                c["symbol"] = s
+                cand.append(c)
+        except Exception as exc:
+            reject["exception"] += 1
+            engine.log.warning("SCORE FAILED | %s | %s", s.upper(), exc)
+    cand.sort(key=lambda x:(x.get("eligible",False),x.get("score",0),x.get("edge",0)), reverse=True)
+    engine.ranked = cand[:engine.EXECUTION_N]
+    engine.desired = [x["symbol"] for x in engine.ranked]
+
+    try:
+        if _ensure_frames("btcusdt"):
+            btc = engine.frame_features("btcusdt","15m")
+            engine.regime = "TREND_UP" if btc and btc["ema9"] > btc["ema21"] and btc["mom"] > 0 else "TREND_DOWN" if btc and btc["ema9"] < btc["ema21"] and btc["mom"] < 0 else "CHOP"
+        else:
+            engine.regime = "UNKNOWN"
+    except Exception:
+        engine.regime = "UNKNOWN"
+
+    engine.log.info(
+        "CRYPTOALPHA 3M | regime=%s | discovered=%d | inspected=%d | ranked=%d | eligible=%d | reject=%s | %s",
+        engine.regime, len(d), len(pool), len(engine.ranked),
+        sum(x.get("eligible",False) for x in cand), reject,
+        " ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("key_level","-")}' for x in engine.ranked)
+    )
+
+engine.rank = _optimized_rank
+
 START_TIME = time.time()
 
 def get_stats():
