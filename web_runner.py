@@ -1,5 +1,5 @@
-"""Render entrypoint for Cryptoalpha robust paper engine v6."""
-from arbitrage_engine_v6 import main
+"""Render entrypoint for Cryptoalpha v7 gated live-capable engine."""
+from arbitrage_engine_v7 import main
 
 if __name__ == "__main__":
     main()
