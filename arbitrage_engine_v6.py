@@ -1,5 +1,5 @@
 '''Cryptoalpha v6 paper engine. LIVE OFF.
-Fixes: no Futures REST exchangeInfo dependency, fewer long-lived sockets, explicit ping/pong, safer reconnects.
+Fixes: no Futures REST exchangeInfo dependency, fewer long-lived sockets, Binance-compatible keepalive, safer reconnects.
 Futures triangular routes are enabled only for contracts explicitly listed in ARB_FUT_TRI_SYMBOLS.
 '''
 import json, logging, os, random, threading, time
@@ -73,7 +73,9 @@ def worker(kind,base,store,idx,symbols,total):
                     state['ws_'+kind]=state[kind+'_sockets_up']>0
                 log.warning('WS CLOSED | %s shard %d/%d | code=%s msg=%s',kind.upper(),idx+1,total,code,msg)
             app=websocket.WebSocketApp(stream_url(base,symbols),on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close,header=['User-Agent: cryptoalpha-v6'])
-            app.run_forever(ping_interval=20,ping_timeout=10,ping_payload='cryptoalpha',skip_utf8_validation=True)
+            # Let websocket-client automatically answer Binance server pings.
+            # Disabling client-originated ping prevents false ping/pong timeouts on Render.
+            app.run_forever(ping_interval=0,ping_timeout=None,skip_utf8_validation=True)
         except Exception as e:
             with lock: state['errors']+=1; state['last_error']=f'{kind} transport: {e}'
         stable=bool(opened_at and time.monotonic()-opened_at>=30)
@@ -124,7 +126,6 @@ def scan():
             ft=[o for a,b,q in FUT_TRI_ROUTES for o in [ftri(a,b,q,eq)] if o]
             s.sort(key=lambda x:x['net_bps'],reverse=True); f.sort(key=lambda x:x['net_bps'],reverse=True); allx=s+f+ft
             with lock:
-                # Paper capture only; no exchange orders are sent.
                 for o in allx[:MAX_ENTRIES]:
                     n=min(o['notional_usdt'],max(.01,state['equity']*RISK),MAX_NOTIONAL); pnl=n*o['net_bps']/10000
                     state['equity']+=pnl; state['peak']=max(state['peak'],state['equity']); state['paper_pnl']+=pnl
