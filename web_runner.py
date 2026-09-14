@@ -1,5 +1,5 @@
 """Render entrypoint for Cryptoalpha v7 gated live-capable engine."""
-from arbitrage_engine_v7 import main
+import arbitrage_engine_v7 as v7
 
 if __name__ == "__main__":
-    main()
+    v7.v6.main()
