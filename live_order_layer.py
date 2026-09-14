@@ -1,4 +1,4 @@
-"""Fail-closed Binance Spot live execution layer."""
+"""Fail-closed Binance Spot live execution layer with recovery unwinds."""
 import hashlib
 import hmac
 import json
@@ -51,7 +51,7 @@ def _signed(method, path, params):
     req = urllib.request.Request(
         BASE + path + "?" + query + "&signature=" + signature,
         method=method,
-        headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/7"},
+        headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/8"},
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -137,11 +137,19 @@ def account():
     return _signed("GET", "/api/v3/account", {"omitZeroBalances": "true"})
 
 
+def _free_balance(asset):
+    data = account()
+    for item in data.get("balances", []):
+        if item.get("asset") == asset:
+            return float(item.get("free", 0) or 0)
+    return 0.0
+
+
 def exchange_info(symbols):
     qs = urllib.parse.urlencode({"symbols": json.dumps(symbols, separators=(",", ":"))})
     req = urllib.request.Request(
         BASE + "/api/v3/exchangeInfo?" + qs,
-        headers={"User-Agent": "cryptoalpha-live/7"},
+        headers={"User-Agent": "cryptoalpha-live/8"},
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -217,6 +225,59 @@ def market_order(symbol, side, quantity):
     )
 
 
+def _unwind_asset_to_usdt(asset, source_symbol, source_filters):
+    """Best-effort emergency conversion of a residual triangle asset back to USDT."""
+    if not asset or asset == "USDT":
+        return {"unwound": True, "asset": asset, "quantity": 0.0, "reason": "no residual asset"}
+
+    unwind_symbol = asset + "USDT"
+    try:
+        info = exchange_info([unwind_symbol])
+        filters = _filters(info, unwind_symbol)
+        free = _free_balance(asset)
+        qty = _round_down(free, _step(filters))
+        if qty <= 0:
+            return {"unwound": True, "asset": asset, "quantity": free, "reason": "no tradable residual balance"}
+
+        unwind_order = market_order(unwind_symbol, "SELL", qty)
+        filled = _filled_qty(unwind_order)
+        if str(unwind_order.get("status", "")).upper() != "FILLED" or filled <= 0:
+            raise LiveOrderError(
+                f"unwind not fully filled: symbol={unwind_symbol} "
+                f"status={unwind_order.get('status')} executedQty={filled:.12f} requestedQty={qty:.12f}"
+            )
+        log.error("EMERGENCY UNWIND OK | %s SELL %.12f -> USDT", unwind_symbol, filled)
+        return {
+            "unwound": True,
+            "asset": asset,
+            "symbol": unwind_symbol,
+            "requested_qty": qty,
+            "filled_qty": filled,
+            "order": unwind_order,
+        }
+    except Exception as e:
+        _trip(f"emergency unwind failed for {asset}: {e}")
+        raise LiveOrderError(f"EMERGENCY UNWIND FAILED for {asset}: {e}") from e
+
+
+def _recover_incomplete_triangle(symbols, sides, filled_by_leg, failed_leg):
+    """Recover residual assets after any failed/partial leg, then keep the breaker tripped."""
+    recovery = []
+    # Each triangle leg leaves one base asset. Convert the last successfully/partially
+    # acquired asset directly to USDT through its known USDT pair.
+    residual_asset = None
+    if failed_leg >= 2 and filled_by_leg[1] > 0:
+        residual_asset = symbols[1].replace("USDT", "") if sides[1] == "SELL" else symbols[1].replace("USDT", "")
+    elif failed_leg >= 1 and filled_by_leg[0] > 0:
+        residual_asset = symbols[0].replace("USDT", "")
+
+    if residual_asset:
+        recovery.append(_unwind_asset_to_usdt(residual_asset, symbols[failed_leg if failed_leg < 3 else 2], None))
+    else:
+        recovery.append({"unwound": True, "reason": "no confirmed residual fill"})
+    return recovery
+
+
 def execute_spot_triangle(opportunity, books):
     global _last_order_ms
     if not enabled():
@@ -251,27 +312,14 @@ def execute_spot_triangle(opportunity, books):
     filters = {symbol: _filters(info, symbol) for symbol in symbols}
 
     acct = account()
-    usdt = next(
-        (
-            float(x.get("free", 0) or 0)
-            for x in acct.get("balances", [])
-            if x.get("asset") == "USDT"
-        ),
-        0.0,
-    )
+    usdt = next((float(x.get("free", 0) or 0) for x in acct.get("balances", []) if x.get("asset") == "USDT"), 0.0)
     risk_budget = usdt * RISK_PCT
-    minimum_notional = max(
-        (_min_notional(filters[symbol]) for symbol in symbols),
-        default=0.0,
-    )
+    minimum_notional = max((_min_notional(filters[symbol]) for symbol in symbols), default=0.0)
 
     if minimum_notional > 0 and risk_budget < minimum_notional:
         return {
             "executed": False,
-            "reason": (
-                f"risk budget {risk_budget:.8f} USDT is below Binance "
-                f"minimum notional {minimum_notional:.8f} USDT"
-            ),
+            "reason": f"risk budget {risk_budget:.8f} USDT is below Binance minimum notional {minimum_notional:.8f} USDT",
             "binance_free_usdt": usdt,
             "risk_pct": RISK_PCT * 100,
             "risk_budget_usdt": risk_budget,
@@ -282,28 +330,23 @@ def execute_spot_triangle(opportunity, books):
     if STATIC_MAX_NOTIONAL > 0:
         notional = min(notional, STATIC_MAX_NOTIONAL)
     if notional <= 0 or notional > usdt:
-        return {
-            "executed": False,
-            "reason": "invalid available USDT risk budget",
-            "binance_free_usdt": usdt,
-            "risk_budget_usdt": risk_budget,
-        }
+        return {"executed": False, "reason": "invalid available USDT risk budget", "binance_free_usdt": usdt, "risk_budget_usdt": risk_budget}
 
-    first_book = books_used[0]
-    first_price = float(first_book[1])
+    first_price = float(books_used[0][1])
     if first_price <= 0:
         return {"executed": False, "reason": "invalid first-leg ask price"}
 
-    first_step = _step(filters[symbols[0]])
-    first_qty = _round_down(notional / first_price, first_step)
+    first_qty = _round_down(notional / first_price, _step(filters[symbols[0]]))
     if first_qty <= 0:
         return {"executed": False, "reason": "quantity below market lot size"}
 
     _last_order_ms = now
     orders = []
+    filled_by_leg = [0.0, 0.0, 0.0]
     try:
         first_order = market_order(symbols[0], sides[0], first_qty)
         orders.append(first_order)
+        filled_by_leg[0] = _filled_qty(first_order)
         first_filled = _require_filled(first_order, "first leg", first_qty)
 
         if sides[1] == "SELL":
@@ -312,14 +355,13 @@ def execute_spot_triangle(opportunity, books):
             second_ask = float(books_used[1][1])
             if second_ask <= 0:
                 raise LiveOrderError("invalid second-leg ask price")
-            second_step = _step(filters[symbols[1]])
-            second_qty = _round_down(first_filled / second_ask, second_step)
-
+            second_qty = _round_down(first_filled / second_ask, _step(filters[symbols[1]]))
         if second_qty <= 0:
             raise LiveOrderError("second leg quantity below market lot size")
 
         second_order = market_order(symbols[1], sides[1], second_qty)
         orders.append(second_order)
+        filled_by_leg[1] = _filled_qty(second_order)
         second_filled = _require_filled(second_order, "second leg", second_qty)
 
         third_qty = second_filled
@@ -328,6 +370,7 @@ def execute_spot_triangle(opportunity, books):
 
         third_order = market_order(symbols[2], sides[2], third_qty)
         orders.append(third_order)
+        filled_by_leg[2] = _filled_qty(third_order)
         third_filled = _require_filled(third_order, "third leg", third_qty)
 
         return {
@@ -343,5 +386,12 @@ def execute_spot_triangle(opportunity, books):
             "circuit_breaker": circuit_status(),
         }
     except Exception as e:
-        _trip(f"incomplete live triangle: {e}")
-        raise
+        failed_leg = min(len(orders), 2)
+        log.error("INCOMPLETE TRIANGLE | path=%s failed_leg=%s filled=%s error=%s", path, failed_leg + 1, filled_by_leg, e)
+        try:
+            recovery = _recover_incomplete_triangle(symbols, sides, filled_by_leg, failed_leg)
+        except Exception as recovery_error:
+            _trip(f"triangle failure plus unrecoverable residual: {recovery_error}")
+            raise
+        _trip(f"incomplete live triangle recovered to USDT: {e}")
+        raise LiveOrderError(f"incomplete live triangle; recovery attempted: {e}; recovery={recovery}") from e
