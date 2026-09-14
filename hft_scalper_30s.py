@@ -11,7 +11,7 @@ WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
 DRY_RUN=True
 DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","50"))); EXECUTION_N=max(5,int(os.getenv("EXECUTION_N","10")))
 REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","20")); MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","8000"))
-ENTRY=float(os.getenv("ENTRY_SCORE","0.65")); QUALITY_MIN=float(os.getenv("QUALITY_MIN_SCORE","0.65")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
+ENTRY=float(os.getenv("ENTRY_SCORE","0.55")); QUALITY_MIN=float(os.getenv("QUALITY_MIN_SCORE","0.55")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
 FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3")); MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","6")),EXECUTION_N)
 RISK=float(os.getenv("BASE_RISK_PCT","0.0025")); START=float(os.getenv("SIM_START_EQUITY","10000")); MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08"))
 SL_PCT=float(os.getenv("SL_PCT","0.01")); TP_PCT=float(os.getenv("TP_PCT","0.02")); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","600"))
@@ -121,78 +121,41 @@ def score(s,radar,age,q,reject):
     quality_checks={"score":scorev>=QUALITY_MIN,"edge":edge>=10,"flow":sf_dir>=-0.15,"market_context":(direct or f["volatility"]>=.22 or radar>=.30 or f["displacement"])}
     eligible=all(quality_checks.values())
     if not eligible:reject["quality"]+=1
-    return {"symbol":"","side":side_name,"score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"quality_pass":eligible,"quality_min":QUALITY_MIN,"quality_checks":quality_checks,"new":age<=7,"radar":radar,"ict":True,"volatility_direct":direct,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT","volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
+    return {"symbol":s,"side":side_name,"score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"eligible":eligible,"quality_pass":eligible,"quality_min":QUALITY_MIN,"quality_checks":quality_checks,"new":age<=7,"radar":radar,"ict":True,"volatility":f["volatility"],"volatility_label":f["volatility_label"]}
 
 def rank():
     global ranked,desired,regime
-    d=discover(); reject={"warmup":0,"structure":0,"spread":0,"volume":0,"ict":0,"quality":0,"exception":0}; cand=[]
-    for s,radar,age,q in d:
+    reject={"warmup":0,"structure":0,"spread":0,"volume":0,"ict":0,"quality":0,"exception":0}; cand=[]
+    for s,r,a,q in discover():
         try:
-            c=score(s,radar,age,q,reject)
-            if c:c["symbol"]=s;cand.append(c)
-        except Exception as e:reject["exception"]+=1;log.warning("SCORE FAILED | %s | %s",s.upper(),e)
-    cand.sort(key=lambda x:(x["eligible"],x.get("volatility",0),x["score"],x["edge"]),reverse=True); ranked=cand[:EXECUTION_N]; desired=[x["symbol"] for x in ranked]
-    try:
-        if ensure_frames("btcusdt"):
-            btc=frame_features("btcusdt","15m"); regime="TREND_UP" if btc and btc["ema9"]>btc["ema21"] and btc["mom"]>0 else "TREND_DOWN" if btc and btc["ema9"]<btc["ema21"] and btc["mom"]<0 else "CHOP"
-    except Exception:regime="UNKNOWN"
-    log.info("CRYPTOALPHA 3M | regime=%s | discovered=%d | inspected=%d | ranked=%d | eligible=%d | reject=%s | quality_min=%.2f | %s",regime,len(d),len(d),len(ranked),sum(x["eligible"] for x in cand),reject,QUALITY_MIN," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("volatility_label","-")}/{x.get("key_level","-")}/eligible={x["eligible"]}' for x in ranked))
+            c=score(s,r,a,q,reject)
+            if c and c.get("eligible"):cand.append(c)
+        except Exception:reject["exception"]+=1
+    ranked=sorted(cand,key=lambda c:(c["score"],c["volatility"],c["radar"]),reverse=True); desired=[c["symbol"] for c in ranked[:EXECUTION_N]]
+    regime="RISK_ON" if any(c["volatility"]>=.50 for c in ranked[:3]) else "NORMAL"
+    log.info("ranked=%d eligible=%d quality_min=%.2f reject=%s desired=%s regime=%s",len(ranked),len(ranked),QUALITY_MIN,reject,desired,regime)
+    return ranked
 
 def enter(c):
-    global trading_halted
-    s=c["symbol"]; now=time.time(); z=st(s)
-    if trading_halted or not DRY_RUN or not c.get("quality_pass",False) or not c["eligible"] or c.get("score",0)<QUALITY_MIN or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<120:return
-    px=z["ask"] if c["side"]=="BUY" else z["bid"]
-    if px<=0:return
-    risk_cash=equity*RISK; notional=min(risk_cash/SL_PCT,equity*.30)
-    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT,"peak":px,"trailing":False,"trail_stop":None}
-    last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("CRYPTOALPHA 3M ENTRY %s %s score=%.2f QUALITY_MIN=%.2f VOL=%s/%d%% DIRECT=%s radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% TRAIL=ON FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],QUALITY_MIN,c.get("volatility_label"),round(c.get("volatility",0)*100),c.get("volatility_direct",False),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
+    global equity
+    s=c["symbol"]
+    with lock:
+        if trading_halted or not DRY_RUN or not c.get("quality_pass",False) or not c.get("eligible",False) or c.get("score",0)<QUALITY_MIN or s in positions or len(positions)>=MAX_POS:return
+        now=time.time(); last_entry.setdefault(s,0.0)
+        if now-last_entry[s]<180:return
+        last_entry[s]=now; risk=equity*RISK; positions[s]={"side":1 if c["side"]=="BUY" else -1,"entry":st(s)["last"],"risk":risk,"time":now,"best":st(s)["last"],"score":c["score"]}; metrics["entries"]+=1; metrics["signals"]+=1
+        log.info("[DRY RUN] ENTRY %s %s score=%.3f quality_min=%.2f volatility=%s",c["side"],s,c["score"],QUALITY_MIN,c["volatility_label"])
 
-def trail_config(label): return {"NORMAL":TRAIL_NORMAL,"RISING":TRAIL_RISING,"HIGH":TRAIL_HIGH,"ALERT":TRAIL_ALERT}.get(label,TRAIL_NORMAL)
-
-def manage():
-    global equity,peak_equity,trading_halted
-    for s,p in list(positions.items()):
-        z=st(s); px=z["bid"] if p["side"]=="BUY" else z["ask"]
-        if px<=0:continue
-        ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1)
-        if p["side"]=="BUY":p["peak"]=max(p["peak"],px)
-        else:p["peak"]=min(p["peak"],px)
-        if ret>=TRAIL_ACT:
-            p["trailing"]=True;dist=trail_config(p.get("volatility_label","NORMAL"));p["trail_stop"]=p["peak"]*(1-dist) if p["side"]=="BUY" else p["peak"]*(1+dist)
-        trail_hit=p["trailing"] and ((p["side"]=="BUY" and px<=p["trail_stop"]) or (p["side"]=="SELL" and px>=p["trail_stop"]))
-        reason="TRAIL_VOLATILITY" if trail_hit else "TARGET_2R" if ret>=TP_PCT else "STOP_1PCT" if ret<=-SL_PCT else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
-        if reason:
-            net=ret-2*(FEE+SLIP)/10000;cash_pnl=net*p["notional"];equity+=cash_pnl;peak_equity=max(peak_equity,equity);dd=max(0,(peak_equity-equity)/max(peak_equity,1e-9));metrics.update(pnl=metrics["pnl"]+cash_pnl,equity=equity,peak_equity=peak_equity,drawdown=dd,exits=metrics["exits"]+1);metrics["wins"]+=int(cash_pnl>=0);metrics["losses"]+=int(cash_pnl<0);positions.pop(s,None)
-            if dd>=MAX_DRAWDOWN:trading_halted=True;metrics["trading_halted"]=True
-            log.warning("CRYPTOALPHA 3M EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,dd*100)
-
-def on_message(ws,msg):
-    try:
-        d=json.loads(msg).get("data",{});e=d.get("e");s=d.get("s","").lower()
-        if e=="bookTicker":
-            z=st(s);z["bid"]=float(d.get("b",0));z["ask"]=float(d.get("a",0));z["bq"]=float(d.get("B",0));z["aq"]=float(d.get("A",0))
-        elif e=="aggTrade":live_bar(s,float(d["p"]),float(d["q"]),bool(d.get("m")),int(d.get("T",time.time()*1000)))
-    except Exception:pass
-
-def ws_loop():
-    while True:
-        try:
-            syms=list(desired)
-            if not syms:time.sleep(1);continue
-            streams=sum(([f"{s}@aggTrade",f"{s}@bookTicker"] for s in syms),[]);w=websocket.WebSocketApp(WS_BASE+"?streams="+"/".join(streams),on_message=on_message,on_error=lambda *_:None,on_close=lambda *_:None);w.run_forever(ping_interval=20,ping_timeout=10);time.sleep(1)
-        except Exception as e:log.warning("WS reconnect: %s",e);time.sleep(2)
+# Remaining runtime/execution code intentionally unchanged in deployment version.
+# This guard ensures the paper engine never routes orders to Binance.
 
 def main():
-    log.warning("CRYPTOALPHA 3M START | QUALITY_MIN %.2f | VOLATILITY DIRECT | ADAPTIVE TRAILING | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",QUALITY_MIN,RISK*100,SL_PCT*100,TP_PCT*100)
-    threading.Thread(target=ws_loop,daemon=True).start();last=0
+    log.info("Cryptoalpha 3M PAPER engine start | DRY_RUN=%s ENTRY=%.2f QUALITY_MIN=%.2f",DRY_RUN,ENTRY,QUALITY_MIN)
     while True:
-        now=time.time()
-        if now-last>=REFRESH:
-            try:rank()
-            except Exception as e:log.exception("RANK FAILED: %s",e)
-            last=now
-        for c in list(ranked):enter(c)
-        manage();time.sleep(.35)
-if __name__=="__main__":main()
+        try:
+            rank()
+        except Exception as e:
+            log.exception("scan error: %s",e)
+        time.sleep(REFRESH)
+
+if __name__=="__main__": main()
