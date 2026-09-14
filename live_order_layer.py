@@ -39,7 +39,7 @@ def _signed(method, path, params):
     query = urllib.parse.urlencode(params, doseq=True)
     signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request(BASE + path + "?" + query + "&signature=" + signature, method=method,
-                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/4"})
+                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/5"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -104,7 +104,7 @@ def account():
 
 def exchange_info(symbols):
     qs = urllib.parse.urlencode({"symbols": json.dumps(symbols, separators=(",", ":"))})
-    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/4"})
+    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/5"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -156,8 +156,8 @@ def execute_spot_triangle(opportunity, books):
     parts = opportunity.get("path", "").split("->")
     if len(parts) != 4 or parts[0] != "USDT" or parts[-1] != "USDT":
         return {"executed": False, "reason": "invalid triangle path"}
-    a, b = parts[1], parts[2]
-    symbols = [a + "USDT", a + b, b + "USDT"]
+    first, second = parts[1], parts[2]
+    symbols = [first + "USDT", first + second, second + "USDT"]
     q = {s: books.get(s) for s in symbols}
     if any(not x for x in q.values()):
         return {"executed": False, "reason": "missing live quote"}
@@ -168,8 +168,6 @@ def execute_spot_triangle(opportunity, books):
     risk_budget = usdt * RISK_PCT
     static_cap = STATIC_MAX_NOTIONAL if STATIC_MAX_NOTIONAL > 0 else risk_budget
     minimum_notional = max((_min_notional(filters[s]) for s in symbols), default=0.0)
-    # Binance-valid sizing: use the larger of the configured risk budget and
-    # the symbol minimum, but never exceed available free USDT or a static cap.
     target_notional = max(risk_budget, minimum_notional)
     if STATIC_MAX_NOTIONAL > 0:
         target_notional = min(target_notional, STATIC_MAX_NOTIONAL)
@@ -181,26 +179,27 @@ def execute_spot_triangle(opportunity, books):
         return {"executed": False, "reason": f"Binance minimum notional {minimum_notional} exceeds free USDT balance {usdt:.8f}",
                 "binance_free_usdt": usdt, "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget,
                 "minimum_notional": minimum_notional}
-    ask_a = float(q[symbols[0]][1])
+    ask_first = float(q[symbols[0]][1])
     step = _step(filters[symbols[0]])
-    qty = _round_down(notional / ask_a, step)
+    qty = _round_down(notional / ask_first, step)
     if qty <= 0:
         return {"executed": False, "reason": "quantity below market lot size"}
     _last_order_ms = now
     orders = []
     try:
         orders.append(market_order(symbols[0], "BUY", qty))
-        a_qty = _filled_qty(orders[-1])
-        if a_qty <= 0:
+        first_qty = _filled_qty(orders[-1])
+        if first_qty <= 0:
             raise LiveOrderError("first leg returned no filled quantity")
-        orders.append(market_order(symbols[1], "SELL", a_qty))
-        b_qty = _filled_qty(orders[-1])
-        if b_qty <= 0:
+        orders.append(market_order(symbols[1], "SELL", first_qty))
+        second_qty = _filled_qty(orders[-1])
+        if second_qty <= 0:
             raise LiveOrderError("second leg returned no filled quantity")
-        orders.append(market_order(symbols[2], "SELL", b_qty))
+        orders.append(market_order(symbols[2], "SELL", second_qty))
         return {"executed": True, "orders": orders, "notional_usdt": notional,
                 "binance_free_usdt": usdt, "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget,
-                "binance_min_notional_usdt": minimum_notional, "circuit_breaker": circuit_status()}
+                "binance_min_notional_usdt": minimum_notional, "path": opportunity.get("path"),
+                "circuit_breaker": circuit_status()}
     except Exception:
         _trip("incomplete live triangle; manual reconciliation required")
         raise
