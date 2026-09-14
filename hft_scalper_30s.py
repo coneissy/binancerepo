@@ -1,8 +1,8 @@
-"""Cryptoalpha 3M ICT/SMC paper scalper.
+"""Buildix aggressive 3M paper scalper.
 
-15M = context, 5M = trend/structure and key levels, 3M = execution.
-Entries require a 5M key-area retest plus 3M liquidity/structure confirmation.
-SL is fixed at 1%, TP fixed at 2%, and live execution is permanently disabled.
+15M context -> 5M trend -> 3M execution.
+Designed for fast, high-volatility opportunities without martingale/doubling.
+Risk is fixed per trade; SL=1%, TP=2% by default. Live execution remains disabled.
 """
 import json, logging, math, os, threading, time
 from collections import deque
@@ -11,28 +11,28 @@ import requests, websocket
 
 BASE=os.getenv("BINANCE_BASE_URL","https://fapi.binance.com")
 WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
-DRY_RUN=os.getenv("DRY_RUN","true").lower()=="true"
+DRY_RUN=True
 DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","50")))
 EXECUTION_N=max(5,int(os.getenv("EXECUTION_N","10")))
-REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","30"))
+REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","20"))
 MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000"))
-MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","12000"))
-ENTRY=float(os.getenv("ENTRY_SCORE","0.64"))
-MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","18"))
+MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","8000"))
+ENTRY=float(os.getenv("ENTRY_SCORE","0.52"))
+MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22"))
 WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
 FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3"))
-MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","8")),EXECUTION_N)
-RISK=float(os.getenv("BASE_RISK_PCT","0.0025")); START=float(os.getenv("SIM_START_EQUITY","10000"))
+MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","6")),EXECUTION_N)
+RISK=float(os.getenv("BASE_RISK_PCT","0.0025"))
+START=float(os.getenv("SIM_START_EQUITY","10000"))
 MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08"))
 SL_PCT=float(os.getenv("SL_PCT","0.01")); TP_PCT=float(os.getenv("TP_PCT","0.02"))
-MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","900"))
+MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","600"))
 MEME=("DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","MOG","TURBO","PNUT","GOAT","POPCAT","NEIRO","BOME","DOGS","CAT","PIG","TRUMP","MELANIA","BRETT","MOODENG","ACT","SPX","FWOG","DEGEN","TOSHI","MYRO","SUNDOG","BABY","WHY","MAGA","LADYS","PONKE","MEW","MICHI","ANDY","SLERF","MOTHER","GIGA","MUMU","PORK","COQ","KISHU","ELON","SAMO","BANANA","CATI","HMSTR","CHILLGUY","VINE","ANIME","PENGU","HAJIMI")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger("cryptoalpha-3m"); http=requests.Session(); lock=threading.RLock()
 hist={}; state={}; cache={}; ranked=[]; desired=[]; positions={}; last_entry={}; regime="UNKNOWN"
 equity=START; peak_equity=START; trading_halted=False
 metrics={"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,"pnl":0.0,"equity":START,"peak_equity":START,"drawdown":0.0,"trading_halted":False}
-
 
 def api(path,params=None):
     for i in range(3):
@@ -47,7 +47,7 @@ def st(s): return state.setdefault(s,{"bid":0.0,"ask":0.0,"bq":0.0,"aq":0.0,"las
 def ema(xs,n):
     if not xs:return 0.0
     k=2/(n+1); e=float(xs[0])
-    for x in xs[1:]:e=float(x)*k+e*(1-k)
+    for x in xs[1:]: e=float(x)*k+e*(1-k)
     return e
 def avg(xs,d=0.0): return mean(xs) if xs else d
 
@@ -63,12 +63,12 @@ def seed(s,iv="3m",limit=120):
     return True
 
 def live_bar(s,p,q,m,ts):
-    books=hist.setdefault(s,{})
-    h=books.setdefault("3m",deque(maxlen=180)); b=int(ts//180000)*180000; v=p*q; z=st(s)
-    if not h or h[-1]["t"]!=b:h.append({"t":b,"o":p,"h":p,"l":p,"c":p,"q":v,"buy":v if not m else 0.0,"sell":v if m else 0.0,"n":1})
+    h=hist.setdefault(s,{}).setdefault("3m",deque(maxlen=180)); b=int(ts//180000)*180000; v=p*q
+    if not h or h[-1]["t"]!=b:
+        h.append({"t":b,"o":p,"h":p,"l":p,"c":p,"q":v,"buy":v if not m else 0.0,"sell":v if m else 0.0,"n":1})
     else:
         x=h[-1]; x["h"]=max(x["h"],p); x["l"]=min(x["l"],p); x["c"]=p; x["q"]+=v; x["buy"]+=v if not m else 0.0; x["sell"]+=v if m else 0.0; x["n"]+=1
-    z["last"]=p
+    st(s)["last"]=p
 
 def frame_features(s,iv):
     h=hist.get(s,{}).get(iv)
@@ -79,30 +79,29 @@ def frame_features(s,iv):
 def structure(s):
     h=hist.get(s,{}).get("3m")
     if not h or len(h)<WARMUP:return None
-    a=list(h); x=a[-1]; prev=a[-2]; c=[z["c"] for z in a]
-    ranges=[(z["h"]-z["l"])/max(z["c"],1e-9) for z in a[-21:-1]]; atr=avg(ranges,.001)
+    a=list(h); x=a[-1]; ranges=[(z["h"]-z["l"])/max(z["c"],1e-9) for z in a[-21:-1]]; atr=avg(ranges,.001)
     flow=(x["buy"]-x["sell"])/max(x["buy"]+x["sell"],1e-9)
-    spread=0.0; z=st(s); mid=(z["bid"]+z["ask"])/2
-    if z["bid"] and z["ask"] and mid:spread=(z["ask"]-z["bid"])/mid*10000
-    # 3M swing structure / liquidity.
+    z=st(s); mid=(z["bid"]+z["ask"])/2; spread=((z["ask"]-z["bid"])/mid*10000) if z["bid"] and z["ask"] and mid else 0.0
     swing_hi=max(z["h"] for z in a[-8:-1]); swing_lo=min(z["l"] for z in a[-8:-1])
-    sweep_long=x["l"]<swing_lo and x["c"]>swing_lo
-    sweep_short=x["h"]>swing_hi and x["c"]<swing_hi
-    bos_long=x["c"]>swing_hi and x["c"]>x["o"]
-    bos_short=x["c"]<swing_lo and x["c"]<x["o"]
-    # Three-candle FVG approximation: current low above candle-2 high, or inverse.
+    sweep_long=x["l"]<swing_lo and x["c"]>swing_lo; sweep_short=x["h"]>swing_hi and x["c"]<swing_hi
+    bos_long=x["c"]>swing_hi and x["c"]>x["o"]; bos_short=x["c"]<swing_lo and x["c"]<x["o"]
     bull_fvg=x["l"]>a[-3]["h"]; bear_fvg=x["h"]<a[-3]["l"]
-    displacement=abs(x["c"]-x["o"])/max(x["c"],1e-9)>=max(atr*1.35,.0012)
-    # 5M key area: recent range edge, plus fresh imbalance/order-block approximation.
+    displacement=abs(x["c"]-x["o"])/max(x["c"],1e-9)>=max(atr*1.15,.0009)
     h5=hist.get(s,{}).get("5m")
     if not h5 or len(h5)<20:return None
-    b=list(h5); y=b[-1]; r5=max(z["h"] for z in b[-12:-1]); l5=min(z["l"] for z in b[-12:-1]);
-    bull_ob=max((z["h"]-z["l"])/max(z["c"],1e-9) for z in b[-8:-1]) if len(b)>8 else atr
-    # Key zones are represented by the 5M range edge with a volatility tolerance.
-    tol=max(atr*1.8,.0015); px=x["c"]
+    b=list(h5); y=b[-1]; r5=max(q["h"] for q in b[-12:-1]); l5=min(q["l"] for q in b[-12:-1]); px=x["c"]
+    tol=max(atr*2.5,.0020)
     near_low=abs(px-l5)/max(px,1e-9)<=tol or x["l"]<=l5*(1+tol)
     near_high=abs(px-r5)/max(px,1e-9)<=tol or x["h"]>=r5*(1-tol)
-    return {"atr":atr,"flow":flow,"spread":spread,"sweep_long":sweep_long,"sweep_short":sweep_short,"bos_long":bos_long,"bos_short":bos_short,"bull_fvg":bull_fvg,"bear_fvg":bear_fvg,"displacement":displacement,"near_low":near_low,"near_high":near_high,"r5":r5,"l5":l5,"close":px,"bull_5":y["c"]>y["o"],"bear_5":y["c"]<y["o"]}
+    rv=x["q"]/max(avg([q["q"] for q in a[-21:-1]],1e-9),1e-9)
+    # Volatility radar: intentionally early/aggressive. It measures activity, not direction.
+    range_now=(x["h"]-x["l"])/max(x["c"],1e-9)
+    range_ratio=range_now/max(atr,1e-9)
+    vol_pressure=max(0,min(1,(rv-1)/2.0))
+    range_pressure=max(0,min(1,(range_ratio-1)/2.0))
+    momentum_pressure=max(0,min(1,abs(x["c"]/a[-5]["c"]-1)/.012))
+    volatility=min(1,.40*vol_pressure+.35*range_pressure+.25*momentum_pressure)
+    return {"atr":atr,"flow":flow,"spread":spread,"sweep_long":sweep_long,"sweep_short":sweep_short,"bos_long":bos_long,"bos_short":bos_short,"bull_fvg":bull_fvg,"bear_fvg":bear_fvg,"displacement":displacement,"near_low":near_low,"near_high":near_high,"r5":r5,"l5":l5,"close":px,"bull_5":y["c"]>y["o"],"bear_5":y["c"]<y["o"],"rv":rv,"range_ratio":range_ratio,"volatility":volatility,"volatility_label":"ALERT" if volatility>=.70 else "HIGH" if volatility>=.50 else "RISING" if volatility>=.30 else "NORMAL"}
 
 def ensure_frames(s):
     for iv in ("3m","5m","15m"):
@@ -127,9 +126,9 @@ def discover():
         except Exception:continue
         base=s.replace("USDT",""); hinted=any(k in base for k in MEME)
         if q<MIN24 and age>30 and not hinted:continue
-        liq=min(math.log10(max(q,1))/8,1); mover=min(abs(ch)/.12,1); fresh=.30 if age<=7 else (.15 if age<=30 else 0); meme=.16 if hinted else 0
-        radar=.30*liq+.25*mover+fresh+meme
-        if hinted or age<=30 or radar>=.28:out.append((s.lower(),min(radar,1),age,q))
+        liq=min(math.log10(max(q,1))/8,1); mover=min(abs(ch)/.08,1); fresh=.30 if age<=7 else (.15 if age<=30 else 0); meme=.16 if hinted else 0
+        radar=min(1,.28*liq+.34*mover+fresh+meme)
+        if hinted or age<=30 or radar>=.22:out.append((s.lower(),radar,age,q))
     out.sort(key=lambda x:(x[1],x[3]),reverse=True); return out[:DISCOVERY_N]
 
 def score(s,radar,age,q,reject):
@@ -138,47 +137,59 @@ def score(s,radar,age,q,reject):
     if not f or not r:reject["structure"]+=1; return None
     if f["spread"]>MAX_SPREAD:reject["spread"]+=1; return None
     h3=hist[s]["3m"]; x=h3[-1]
-    if x["q"]<MIN3:reject["volume"]+=1; return None
-    # Key rule: trade only inside the 5M trend and at a 5M range edge after a retest.
-    long_loc=r["bull5"] and f["near_low"]
-    short_loc=r["bear5"] and f["near_high"]
-    long_trigger=f["sweep_long"] or (f["bos_long"] and f["bull_fvg"])
-    short_trigger=f["sweep_short"] or (f["bos_short"] and f["bear_fvg"])
-    side=1 if long_loc and long_trigger and r["bull15"] else -1 if short_loc and short_trigger and r["bear15"] else 0
+    if x["q"]<MIN3 and f["rv"]<.65:reject["volume"]+=1; return None
+    # Aggressive adaptive gate: keep higher-timeframe direction when available,
+    # but do not require a perfect ICT sweep+FVG combination on every entry.
+    long_bias=r["bull15"] or r["bull5"]; short_bias=r["bear15"] or r["bear5"]
+    long_trigger=f["sweep_long"] or f["bos_long"] or f["bull_fvg"]
+    short_trigger=f["sweep_short"] or f["bos_short"] or f["bear_fvg"]
+    sf=f["flow"]
+    long_score=.34*int(long_bias)+.20*int(long_trigger)+.14*int(f["displacement"])+.12*int(f["near_low"])+.10*max(0,min((sf+1)/2,1))+.10*f["volatility"]+.06*radar
+    short_score=.34*int(short_bias)+.20*int(short_trigger)+.14*int(f["displacement"])+.12*int(f["near_high"])+.10*max(0,min((-sf+1)/2,1))+.10*f["volatility"]+.06*radar
+    if not long_bias and not short_bias:
+        # In chop, only trade a strong volatility breakout with clear direction.
+        long_score=.18*int(x["c"]>x["o"])+.24*int(long_trigger)+.20*f["volatility"]+.20*max(0,min((sf+1)/2,1))+.18*radar
+        short_score=.18*int(x["c"]<x["o"])+.24*int(short_trigger)+.20*f["volatility"]+.20*max(0,min((-sf+1)/2,1))+.18*radar
+    side=1 if long_score>=short_score and long_score>=ENTRY else -1 if short_score>long_score and short_score>=ENTRY else 0
     if side==0:
-        reject["ict"]+=1; return {"symbol":"","side":"BUY" if long_loc else "SELL" if short_loc else "NEUTRAL","score":0.0,"edge":0.0,"atr":f["atr"],"flow":f["flow"],"eligible":False,"new":age<=7,"radar":radar,"ict":False}
-    sf=f["flow"]*side
-    displacement=1 if f["displacement"] else 0; sweep=1 if (f["sweep_long"] if side>0 else f["sweep_short"]) else 0; fvg=1 if (f["bull_fvg"] if side>0 else f["bear_fvg"]) else 0
-    trend=1.0; align=max(0,min((sf+1)/2,1)); rv=max(0,min((x["q"]/max(avg([z["q"] for z in h3[-21:-1]],1e-9),1e-9)-1)/1.5,1));
-    scorev=.27*trend+.22*sweep+.18*displacement+.14*fvg+.11*align+.05*rv+.03*min(radar,1)
-    if sf<.05:scorev-=.10
-    scorev=max(0,min(1,scorev)); edge=(TP_PCT*10000)-(2*(FEE+SLIP)+f["spread"])
-    eligible=scorev>=ENTRY and edge>=10 and sf>=.05
+        reject["ict"]+=1
+        return {"symbol":"","side":"BUY" if long_score>short_score else "SELL" if short_score>long_score else "NEUTRAL","score":max(long_score,short_score),"edge":0.0,"atr":f["atr"],"flow":sf,"eligible":False,"new":age<=7,"radar":radar,"ict":False,"volatility":f["volatility"],"volatility_label":f["volatility_label"]}
+    scorev=long_score if side>0 else short_score
+    sf_dir=sf*side
+    edge=TP_PCT*10000-(2*(FEE+SLIP)+f["spread"])
+    eligible=scorev>=ENTRY and edge>=10 and sf_dir>=-0.15 and (f["volatility"]>=.22 or radar>=.30 or f["displacement"])
     if not eligible:reject["quality"]+=1
-    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":scorev,"edge":edge,"atr":f["atr"],"flow":sf,"z":0.0,"rv":x["q"]/max(avg([z["q"] for z in h3[-21:-1]],1e-9),1e-9),"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"new":age<=7,"radar":radar,"ict":True,"sweep":bool(sweep),"fvg":bool(fvg),"displacement":bool(displacement),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_RETEST" if side>0 else "5M_HIGH_RETEST"}
+    key="5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT"
+    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"new":age<=7,"radar":radar,"ict":True,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":key,"volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
 
 def rank():
     global ranked,desired,regime
     d=discover(); reject={"warmup":0,"structure":0,"spread":0,"volume":0,"ict":0,"quality":0,"exception":0}; cand=[]
-    for s,_,_,_ in d:
+    for s,radar,age,q in d:
         try:
-            c=score(s,_[0] if False else next(v[1] for v in d if v[0]==s),next(v[2] for v in d if v[0]==s),next(v[3] for v in d if v[0]==s),reject)
+            c=score(s,radar,age,q,reject)
             if c:c["symbol"]=s;cand.append(c)
-        except Exception:reject["exception"]+=1
-    cand.sort(key=lambda x:(x["eligible"],x["score"],x["edge"]),reverse=True); ranked=cand[:EXECUTION_N]; desired=[x["symbol"] for x in ranked]
-    btc=frame_features("btcusdt","15m") if ensure_frames("btcusdt") else None
-    regime="TREND_UP" if btc and btc["ema9"]>btc["ema21"] and btc["mom"]>0 else "TREND_DOWN" if btc and btc["ema9"]<btc["ema21"] and btc["mom"]<0 else "CHOP"
-    log.info("CRYPTOALPHA 3M | regime=%s | discovered=%d | ranked=%d | eligible=%d | reject=%s | %s",regime,len(d),len(ranked),sum(x["eligible"] for x in cand),reject," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("key_level", "-")}' for x in ranked))
+        except Exception as e:
+            reject["exception"]+=1;log.warning("SCORE FAILED | %s | %s",s.upper(),e)
+    cand.sort(key=lambda x:(x["eligible"],x.get("volatility",0),x["score"],x["edge"]),reverse=True)
+    ranked=cand[:EXECUTION_N]; desired=[x["symbol"] for x in ranked]
+    try:
+        if ensure_frames("btcusdt"):
+            btc=frame_features("btcusdt","15m"); regime="TREND_UP" if btc and btc["ema9"]>btc["ema21"] and btc["mom"]>0 else "TREND_DOWN" if btc and btc["ema9"]<btc["ema21"] and btc["mom"]<0 else "CHOP"
+    except Exception: regime="UNKNOWN"
+    log.info("CRYPTOALPHA 3M | regime=%s | discovered=%d | inspected=%d | ranked=%d | eligible=%d | reject=%s | %s",regime,len(d),len(d),len(ranked),sum(x["eligible"] for x in cand),reject," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("volatility_label","-")}/{x.get("key_level","-")}' for x in ranked))
 
 def enter(c):
     global trading_halted
     s=c["symbol"]; now=time.time(); z=st(s)
-    if trading_halted or not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<180:return
+    if trading_halted or not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<120:return
     px=z["ask"] if c["side"]=="BUY" else z["bid"]
     if px<=0:return
+    # Fixed-risk sizing. A loss never increases the next position: NO DOUBLING/MARTINGALE.
     risk_cash=equity*RISK; notional=min(risk_cash/SL_PCT,equity*.30)
-    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT}; last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("CRYPTOALPHA ENTRY %s %s score=%.2f key=%s sweep=%s fvg=%s notional=%.2f SL=%.2f%% TP=%.2f%% [DRY RUN]",c["side"],s.upper(),c["score"],c.get("key_level"),c.get("sweep"),c.get("fvg"),notional,SL_PCT*100,TP_PCT*100)
+    positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT}; last_entry[s]=now
+    metrics["entries"]+=1;metrics["signals"]+=1
+    log.warning("CRYPTOALPHA ENTRY %s %s score=%.2f VOL=%s/%d%% radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],c.get("volatility_label"),round(c.get("volatility",0)*100),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
 
 def manage():
     global equity,peak_equity,trading_halted
@@ -188,10 +199,8 @@ def manage():
         ret=(px/p["entry"]-1)*(1 if p["side"]=="BUY" else -1)
         reason="TARGET_2R" if ret>=TP_PCT else "STOP_1PCT" if ret<=-SL_PCT else "TIME" if time.time()-p["opened"]>=MAX_HOLD else None
         if reason:
-            net=ret-2*(FEE+SLIP)/10000; cash_pnl=net*p["notional"]; equity+=cash_pnl; peak_equity=max(peak_equity,equity); dd=max(0,(peak_equity-equity)/max(peak_equity,1e-9)); metrics["pnl"]+=cash_pnl; metrics["equity"]=equity; metrics["peak_equity"]=peak_equity; metrics["drawdown"]=dd; metrics["exits"]+=1
-            if cash_pnl>=0:metrics["wins"]+=1
-            else:metrics["losses"]+=1
-            positions.pop(s,None)
+            net=ret-2*(FEE+SLIP)/10000; cash_pnl=net*p["notional"]; equity+=cash_pnl; peak_equity=max(peak_equity,equity); dd=max(0,(peak_equity-equity)/max(peak_equity,1e-9)); metrics.update(pnl=metrics["pnl"]+cash_pnl,equity=equity,peak_equity=peak_equity,drawdown=dd,exits=metrics["exits"]+1)
+            metrics["wins"]+=int(cash_pnl>=0);metrics["losses"]+=int(cash_pnl<0);positions.pop(s,None)
             if dd>=MAX_DRAWDOWN:trading_halted=True;metrics["trading_halted"]=True
             log.warning("CRYPTOALPHA EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,dd*100)
 
@@ -207,14 +216,14 @@ def ws_loop():
     while True:
         try:
             syms=list(desired)
-            if not syms:time.sleep(2);continue
+            if not syms:time.sleep(1);continue
             streams=sum(([f"{s}@aggTrade",f"{s}@bookTicker"] for s in syms),[])
             w=websocket.WebSocketApp(WS_BASE+"?streams="+"/".join(streams),on_message=on_message,on_error=lambda *_:None,on_close=lambda *_:None);w.run_forever(ping_interval=20,ping_timeout=10);time.sleep(1)
         except Exception as e:log.warning("WS reconnect: %s",e);time.sleep(2)
 
 def main():
-    if not DRY_RUN:raise RuntimeError("LIVE EXECUTION DISABLED: DRY_RUN must remain true")
-    log.warning("CRYPTOALPHA 3M ICT/SMC ENGINE START | 15m context + 5m trend/key levels + 3m entry | SL=%.2f%% TP=%.2f%% RISK=%.3f%% | DRY_RUN=%s",SL_PCT*100,TP_PCT*100,RISK*100,DRY_RUN)
+    if not DRY_RUN:raise RuntimeError("LIVE EXECUTION DISABLED: paper mode only")
+    log.warning("BUILDIX AGGRESSIVE 3M START | VOLATILITY RADAR | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",RISK*100,SL_PCT*100,TP_PCT*100)
     threading.Thread(target=ws_loop,daemon=True).start();last=0
     while True:
         now=time.time()
@@ -223,6 +232,6 @@ def main():
             except Exception as e:log.exception("RANK FAILED: %s",e)
             last=now
         for c in list(ranked):enter(c)
-        manage();time.sleep(.5)
+        manage();time.sleep(.35)
 
 if __name__=="__main__":main()
