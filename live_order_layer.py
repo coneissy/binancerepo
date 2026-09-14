@@ -2,6 +2,10 @@
 
 Private authentication is tested before live orders are allowed. Credentials are
 read only from environment variables and must never be committed to Git.
+
+Live sizing is based on the actual Binance free USDT balance. The configured
+risk percentage is applied to that balance. MAX_LIVE_NOTIONAL_USDT=0 means no
+separate static notional cap, while Binance symbol filters remain authoritative.
 """
 import hashlib, hmac, json, logging, os, time, urllib.parse, urllib.request
 
@@ -12,8 +16,7 @@ API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 LIVE = os.getenv("LIVE_TRADING", "false").lower() in {"1", "true", "yes", "on"}
 STARTING_BALANCE = max(0.0, float(os.getenv("LIVE_STARTING_BALANCE_USDT", "30")))
 RISK_PCT = min(0.01, max(0.0005, float(os.getenv("ARB_RISK_PCT", "0.01"))))
-RISK_BUDGET = STARTING_BALANCE * RISK_PCT
-MAX_NOTIONAL = min(max(0.0, float(os.getenv("MAX_LIVE_NOTIONAL_USDT", str(RISK_BUDGET)))), RISK_BUDGET)
+STATIC_MAX_NOTIONAL = max(0.0, float(os.getenv("MAX_LIVE_NOTIONAL_USDT", "0")))
 MIN_NET_BPS = max(0.0, float(os.getenv("ARB_MIN_NET_BPS", "3")))
 RECV_WINDOW = min(60000, max(1000, int(os.getenv("BINANCE_RECV_WINDOW", "5000"))))
 COOLDOWN_MS = max(1000, int(os.getenv("LIVE_ORDER_COOLDOWN_MS", "5000")))
@@ -44,7 +47,7 @@ def _signed(method, path, params):
     query = urllib.parse.urlencode(params, doseq=True)
     signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request(BASE + path + "?" + query + "&signature=" + signature, method=method,
-                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/2"})
+                                 headers={"X-MBX-APIKEY": API_KEY, "User-Agent": "cryptoalpha-live/3"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -84,8 +87,9 @@ def auth_status():
 
 def circuit_status():
     return {"halted": _live_halted, "session_loss_usdt": round(_session_loss_usdt, 8),
-            "risk_budget_usdt": round(RISK_BUDGET, 8),
-            "remaining_risk_usdt": round(max(0.0, RISK_BUDGET - _session_loss_usdt), 8)}
+            "risk_pct": RISK_PCT * 100,
+            "fallback_risk_budget_usdt": round(STARTING_BALANCE * RISK_PCT, 8),
+            "remaining_fallback_risk_usdt": round(max(0.0, STARTING_BALANCE * RISK_PCT - _session_loss_usdt), 8)}
 
 def _trip(reason):
     global _live_halted
@@ -97,18 +101,18 @@ def record_realized_pnl(pnl_usdt):
     pnl = float(pnl_usdt)
     if pnl < 0:
         _session_loss_usdt += -pnl
-        if _session_loss_usdt >= RISK_BUDGET:
-            _trip("cumulative live loss reached risk budget")
     return circuit_status()
 
 def account():
-    if not enabled():
+    if not API_KEY or not API_SECRET:
+        raise LiveOrderError("Binance private authentication is not configured")
+    if not _check_auth():
         raise LiveOrderError("Binance private authentication is not ready")
     return _signed("GET", "/api/v3/account", {"omitZeroBalances": "true"})
 
 def exchange_info(symbols):
     qs = urllib.parse.urlencode({"symbols": json.dumps(symbols, separators=(",", ":"))})
-    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/2"})
+    req = urllib.request.Request(BASE + "/api/v3/exchangeInfo?" + qs, headers={"User-Agent": "cryptoalpha-live/3"})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -169,15 +173,17 @@ def execute_spot_triangle(opportunity, books):
     filters = {s: _filters(info, s) for s in symbols}
     acct = account()
     usdt = next((float(x.get("free", 0) or 0) for x in acct.get("balances", []) if x.get("asset") == "USDT"), 0.0)
-    notional = min(MAX_NOTIONAL, max(0.0, RISK_BUDGET - _session_loss_usdt), usdt)
+    risk_budget = usdt * RISK_PCT
+    static_cap = STATIC_MAX_NOTIONAL if STATIC_MAX_NOTIONAL > 0 else risk_budget
+    notional = min(static_cap, max(0.0, risk_budget - _session_loss_usdt), usdt)
     if notional <= 0:
-        _trip("no remaining live risk budget")
-        return {"executed": False, "reason": "risk budget exhausted"}
+        return {"executed": False, "reason": "no available Binance USDT risk budget", "binance_free_usdt": usdt,
+                "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget}
     for s in symbols:
         minimum = _min_notional(filters[s])
         if minimum and notional < minimum:
-            return {"executed": False, "reason": f"{s} minimum notional {minimum} exceeds hard cap {RISK_BUDGET:.8f}",
-                    "risk_budget_usdt": RISK_BUDGET}
+            return {"executed": False, "reason": f"{s} minimum notional {minimum} exceeds available risk notional {notional:.8f}",
+                    "binance_free_usdt": usdt, "risk_budget_usdt": risk_budget, "minimum_notional": minimum}
     ask_a = float(q[symbols[0]][1])
     step = _step(filters[symbols[0]])
     qty = _round_down(notional / ask_a, step)
@@ -196,7 +202,7 @@ def execute_spot_triangle(opportunity, books):
             raise LiveOrderError("second leg returned no filled quantity")
         orders.append(market_order(symbols[2], "SELL", b_qty))
         return {"executed": True, "orders": orders, "notional_usdt": notional,
-                "risk_pct": RISK_PCT * 100, "risk_budget_usdt": RISK_BUDGET,
+                "binance_free_usdt": usdt, "risk_pct": RISK_PCT * 100, "risk_budget_usdt": risk_budget,
                 "circuit_breaker": circuit_status()}
     except Exception:
         _trip("incomplete live triangle; manual reconciliation required")
