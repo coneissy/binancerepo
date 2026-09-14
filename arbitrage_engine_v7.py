@@ -3,7 +3,7 @@ LIVE_TRADING is false unless explicitly enabled in Render. Futures/basis and fut
 """
 import os, time, logging
 import arbitrage_engine_v6 as v6
-from live_order_layer import enabled, execute_spot_triangle
+from live_order_layer import enabled, execute_spot_triangle, circuit_status
 
 log = logging.getLogger("cryptoalpha-v7")
 LIVE_COOLDOWN_MS = max(1000, int(os.getenv("LIVE_ORDER_COOLDOWN_MS", "5000")))
@@ -13,6 +13,10 @@ _original_stats = v6.stats
 v6.START = float(os.getenv("SIM_START_EQUITY", "30"))
 v6.RISK = min(0.01, max(0.0005, float(os.getenv("ARB_RISK_PCT", "0.01"))))
 v6.MIN_NET = max(0.0, float(os.getenv("ARB_MIN_NET_BPS", "3")))
+
+
+def _live_configured():
+    return os.getenv('LIVE_TRADING', 'false').lower() in {'1','true','yes','on'}
 
 
 def live_scan():
@@ -43,7 +47,10 @@ def live_scan():
                             v6.state['errors'] += 1
                             v6.state['last_error'] = 'LIVE ORDER: ' + str(e)
                         log.error('LIVE ORDER BLOCKED/FAILED: %s', e)
-            elif not enabled():
+            elif not _live_configured():
+                # Paper capture is allowed only when live mode is not configured.
+                # If LIVE_TRADING is configured but the safety circuit is halted,
+                # fail closed instead of silently switching to paper execution.
                 with v6.lock:
                     for o in allx[:v6.MAX_ENTRIES]:
                         n = min(o['notional_usdt'], max(.01, v6.state['equity']*v6.RISK), v6.MAX_NOTIONAL)
@@ -73,13 +80,16 @@ def stats_v7():
     out = _original_stats()
     out['engine'] = 'cryptoalpha-v7'
     out['live_execution'] = enabled()
-    out['live_mode_configured'] = os.getenv('LIVE_TRADING', 'false').lower() in {'1','true','yes','on'}
+    out['live_mode_configured'] = _live_configured()
     out['live_supported_engine'] = 'SPOT_TRIANGULAR'
     out['live_cooldown_ms'] = LIVE_COOLDOWN_MS
     out['configured_balance_usdt'] = float(os.getenv('SIM_START_EQUITY', '30'))
     out['configured_risk_pct'] = v6.RISK * 100
+    out['configured_risk_budget_usdt'] = round(float(os.getenv('LIVE_STARTING_BALANCE_USDT', '30')) * v6.RISK, 8)
+    out['configured_live_notional_cap_usdt'] = round(min(max(0.0, float(os.getenv('MAX_LIVE_NOTIONAL_USDT', str(out['configured_risk_budget_usdt'])))), out['configured_risk_budget_usdt']), 8)
     out['configured_min_net_bps'] = v6.MIN_NET
-    out['live_note'] = 'REAL ORDERS REQUIRE LIVE_TRADING=true; credentials are never read from source code.'
+    out['live_circuit_breaker'] = circuit_status()
+    out['live_note'] = 'REAL ORDERS REQUIRE LIVE_TRADING=true; safety circuit is fail-closed; credentials are never read from source code.'
     return out
 
 v6.stats = stats_v7
