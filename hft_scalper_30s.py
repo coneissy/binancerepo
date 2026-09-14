@@ -11,7 +11,7 @@ WS_BASE=os.getenv("BINANCE_WS_BASE_URL","wss://fstream.binance.com/stream")
 DRY_RUN=True
 DISCOVERY_N=max(30,int(os.getenv("DISCOVERY_N","50"))); EXECUTION_N=max(5,int(os.getenv("EXECUTION_N","10")))
 REFRESH=float(os.getenv("RANK_REFRESH_SECONDS","20")); MIN24=float(os.getenv("MIN_24H_QUOTE_VOLUME","500000")); MIN3=float(os.getenv("MIN_3M_QUOTE_VOLUME","8000"))
-ENTRY=float(os.getenv("ENTRY_SCORE","0.52")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
+ENTRY=float(os.getenv("ENTRY_SCORE","0.70")); QUALITY_MIN=float(os.getenv("QUALITY_MIN_SCORE","0.70")); MAX_SPREAD=float(os.getenv("MAX_SPREAD_BPS","22")); WARMUP=max(25,int(os.getenv("WARMUP_BARS","40")))
 FEE=float(os.getenv("EST_FEE_BPS","4")); SLIP=float(os.getenv("EST_SLIPPAGE_BPS","3")); MAX_POS=min(int(os.getenv("MAX_SIMULTANEOUS_POSITIONS","6")),EXECUTION_N)
 RISK=float(os.getenv("BASE_RISK_PCT","0.0025")); START=float(os.getenv("SIM_START_EQUITY","10000")); MAX_DRAWDOWN=float(os.getenv("MAX_DRAWDOWN_PCT","0.08"))
 SL_PCT=float(os.getenv("SL_PCT","0.01")); TP_PCT=float(os.getenv("TP_PCT","0.02")); MAX_HOLD=float(os.getenv("MAX_HOLD_SECONDS","600"))
@@ -97,16 +97,20 @@ def discover():
     out.sort(key=lambda x:(x[1],x[3]),reverse=True); return out[:DISCOVERY_N]
 
 def score(s,radar,age,q,reject):
+    # Stage 1: market/structure prerequisites.
     if not ensure_frames(s):reject["warmup"]+=1; return None
     f=structure(s); r=higher_regime(s)
     if not f or not r:reject["structure"]+=1; return None
     if f["spread"]>MAX_SPREAD:reject["spread"]+=1; return None
     h3=hist[s]["3m"]; x=h3[-1]
     if x["q"]<MIN3 and f["rv"]<.65:reject["volume"]+=1; return None
+
+    # Stage 2: directional score. This stage does NOT authorize an entry.
     long_bias=r["bull15"] or r["bull5"]; short_bias=r["bear15"] or r["bear5"]; long_trigger=f["sweep_long"] or f["bos_long"] or f["bull_fvg"]; short_trigger=f["sweep_short"] or f["bos_short"] or f["bear_fvg"]; sf=f["flow"]
     long_score=.34*int(long_bias)+.20*int(long_trigger)+.14*int(f["displacement"])+.12*int(f["near_low"])+.10*max(0,min((sf+1)/2,1))+.10*f["volatility"]+.06*radar
     short_score=.34*int(short_bias)+.20*int(short_trigger)+.14*int(f["displacement"])+.12*int(f["near_high"])+.10*max(0,min((-sf+1)/2,1))+.10*f["volatility"]+.06*radar
-    # Volatility-direct mode: a strong expansion can create an entry even without a full ICT trigger.
+
+    # Volatility-direct mode can improve the score, but can NEVER bypass the hard quality gate.
     direct_long=f["volatility"]>=.50 and x["c"]>x["o"] and (f["flow"]>=-.10 or radar>=.45)
     direct_short=f["volatility"]>=.50 and x["c"]<x["o"] and (f["flow"]<=.10 or radar>=.45)
     if not long_bias and not short_bias:
@@ -114,13 +118,25 @@ def score(s,radar,age,q,reject):
         short_score=.18*int(x["c"]<x["o"])+.24*int(short_trigger)+.20*f["volatility"]+.20*max(0,min((-sf+1)/2,1))+.18*radar
     if direct_long: long_score=max(long_score,.53+.18*f["volatility"]+.08*radar)
     if direct_short: short_score=max(short_score,.53+.18*f["volatility"]+.08*radar)
-    side=1 if long_score>=short_score and long_score>=ENTRY else -1 if short_score>long_score and short_score>=ENTRY else 0
-    if side==0:
-        reject["ict"]+=1; return {"symbol":"","side":"BUY" if long_score>short_score else "SELL" if short_score>long_score else "NEUTRAL","score":max(long_score,short_score),"edge":0.0,"atr":f["atr"],"flow":sf,"eligible":False,"new":age<=7,"radar":radar,"ict":False,"volatility":f["volatility"],"volatility_label":f["volatility_label"]}
-    scorev=long_score if side>0 else short_score; sf_dir=sf*side; edge=TP_PCT*10000-(2*(FEE+SLIP)+f["spread"]); direct=(direct_long if side>0 else direct_short)
-    eligible=scorev>=ENTRY and edge>=10 and sf_dir>=-0.15 and (direct or f["volatility"]>=.22 or radar>=.30 or f["displacement"])
+
+    best=long_score if long_score>=short_score else short_score
+    side=1 if long_score>=short_score else -1
+    side_name="BUY" if side>0 else "SELL"
+    if best<ENTRY:
+        reject["ict"]+=1
+        return {"symbol":"","side":side_name,"score":max(0,min(1,best)),"edge":0.0,"atr":f["atr"],"flow":sf*side,"eligible":False,"quality_pass":False,"quality_min":QUALITY_MIN,"new":age<=7,"radar":radar,"ict":False,"volatility":f["volatility"],"volatility_label":f["volatility_label"]}
+
+    # Stage 3: HARD QUALITY GATE. Every condition must pass before eligible=True.
+    scorev=best; sf_dir=sf*side; edge=TP_PCT*10000-(2*(FEE+SLIP)+f["spread"]); direct=(direct_long if side>0 else direct_short)
+    quality_checks={
+        "score":scorev>=QUALITY_MIN,
+        "edge":edge>=10,
+        "flow":sf_dir>=-0.15,
+        "market_context":(direct or f["volatility"]>=.22 or radar>=.30 or f["displacement"]),
+    }
+    eligible=all(quality_checks.values())
     if not eligible:reject["quality"]+=1
-    return {"symbol":"","side":"BUY" if side>0 else "SELL","score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"new":age<=7,"radar":radar,"ict":True,"volatility_direct":direct,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT","volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
+    return {"symbol":"","side":side_name,"score":max(0,min(1,scorev)),"edge":edge,"atr":f["atr"],"flow":sf_dir,"z":0.0,"rv":f["rv"],"ret":x["c"]/h3[-2]["c"]-1,"eligible":eligible,"quality_pass":eligible,"quality_min":QUALITY_MIN,"quality_checks":quality_checks,"new":age<=7,"radar":radar,"ict":True,"volatility_direct":direct,"sweep":bool(f["sweep_long"] if side>0 else f["sweep_short"]),"fvg":bool(f["bull_fvg"] if side>0 else f["bear_fvg"]),"displacement":bool(f["displacement"]),"trend15":r["bull15"] if side>0 else r["bear15"],"trend5":r["bull5"] if side>0 else r["bear5"],"key_level":"5M_LOW_OR_BREAKOUT" if side>0 else "5M_HIGH_OR_BREAKOUT","volatility":f["volatility"],"volatility_label":f["volatility_label"],"range_ratio":f["range_ratio"]}
 
 def rank():
     global ranked,desired,regime
@@ -135,18 +151,19 @@ def rank():
         if ensure_frames("btcusdt"):
             btc=frame_features("btcusdt","15m"); regime="TREND_UP" if btc and btc["ema9"]>btc["ema21"] and btc["mom"]>0 else "TREND_DOWN" if btc and btc["ema9"]<btc["ema21"] and btc["mom"]<0 else "CHOP"
     except Exception:regime="UNKNOWN"
-    log.info("BUILDIX AGGRESSIVE | regime=%s | discovered=%d | inspected=%d | ranked=%d | eligible=%d | reject=%s | %s",regime,len(d),len(d),len(ranked),sum(x["eligible"] for x in cand),reject," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("volatility_label","-")}/{x.get("key_level","-")}' for x in ranked))
+    log.info("CRYPTOALPHA 3M | regime=%s | discovered=%d | inspected=%d | ranked=%d | eligible=%d | reject=%s | quality_min=%.2f | %s",regime,len(d),len(d),len(ranked),sum(x["eligible"] for x in cand),reject,QUALITY_MIN," ".join(f'{x["symbol"]}:{x["score"]:.2f}/{x["side"]}/{x.get("volatility_label","-")}/{x.get("key_level","-")}/eligible={x["eligible"]}' for x in ranked))
 
 def enter(c):
     global trading_halted
     s=c["symbol"]; now=time.time(); z=st(s)
-    if trading_halted or not c["eligible"] or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<120:return
+    # Final defense-in-depth: entry requires the hard quality gate to be true.
+    if trading_halted or not DRY_RUN or not c.get("quality_pass",False) or not c["eligible"] or c.get("score",0)<QUALITY_MIN or s in positions or len(positions)>=MAX_POS or now-last_entry.get(s,0)<120:return
     px=z["ask"] if c["side"]=="BUY" else z["bid"]
     if px<=0:return
     risk_cash=equity*RISK; notional=min(risk_cash/SL_PCT,equity*.30)
     positions[s]={**c,"entry":px,"notional":notional,"opened":now,"risk_cash":risk_cash,"sl_pct":SL_PCT,"tp_pct":TP_PCT,"peak":px,"trailing":False,"trail_stop":None}
     last_entry[s]=now; metrics["entries"]+=1; metrics["signals"]+=1
-    log.warning("BUILDIX ENTRY %s %s score=%.2f VOL=%s/%d%% DIRECT=%s radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% TRAIL=ON FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],c.get("volatility_label"),round(c.get("volatility",0)*100),c.get("volatility_direct",False),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
+    log.warning("CRYPTOALPHA 3M ENTRY %s %s score=%.2f QUALITY_MIN=%.2f VOL=%s/%d%% DIRECT=%s radar=%d%% notional=%.2f SL=%.2f%% TP=%.2f%% TRAIL=ON FIXED-RISK NO-DOUBLING [DRY RUN]",c["side"],s.upper(),c["score"],QUALITY_MIN,c.get("volatility_label"),round(c.get("volatility",0)*100),c.get("volatility_direct",False),round(c.get("radar",0)*100),notional,SL_PCT*100,TP_PCT*100)
 
 def trail_config(label):
     return {"NORMAL":TRAIL_NORMAL,"RISING":TRAIL_RISING,"HIGH":TRAIL_HIGH,"ALERT":TRAIL_ALERT}.get(label,TRAIL_NORMAL)
@@ -166,7 +183,7 @@ def manage():
         if reason:
             net=ret-2*(FEE+SLIP)/10000; cash_pnl=net*p["notional"]; equity+=cash_pnl; peak_equity=max(peak_equity,equity); dd=max(0,(peak_equity-equity)/max(peak_equity,1e-9)); metrics.update(pnl=metrics["pnl"]+cash_pnl,equity=equity,peak_equity=peak_equity,drawdown=dd,exits=metrics["exits"]+1); metrics["wins"]+=int(cash_pnl>=0); metrics["losses"]+=int(cash_pnl<0); positions.pop(s,None)
             if dd>=MAX_DRAWDOWN:trading_halted=True;metrics["trading_halted"]=True
-            log.warning("BUILDIX EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,dd*100)
+            log.warning("CRYPTOALPHA 3M EXIT %s %s net=%.3f%% cash=%.2f equity=%.2f dd=%.2f%%",reason,s.upper(),net*100,cash_pnl,equity,dd*100)
 
 def on_message(ws,msg):
     try:
@@ -185,7 +202,7 @@ def ws_loop():
         except Exception as e:log.warning("WS reconnect: %s",e);time.sleep(2)
 
 def main():
-    log.warning("BUILDIX AGGRESSIVE 3M START | VOLATILITY DIRECT | ADAPTIVE TRAILING | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",RISK*100,SL_PCT*100,TP_PCT*100)
+    log.warning("CRYPTOALPHA 3M START | HARD QUALITY GATE %.2f | VOLATILITY DIRECT CANNOT BYPASS QUALITY | ADAPTIVE TRAILING | FIXED RISK %.3f%% | SL %.2f%% | TP %.2f%% | NO DOUBLING | PAPER",QUALITY_MIN,RISK*100,SL_PCT*100,TP_PCT*100)
     threading.Thread(target=ws_loop,daemon=True).start(); last=0
     while True:
         now=time.time()
