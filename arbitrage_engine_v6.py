@@ -1,6 +1,7 @@
-'''Cryptoalpha v6 paper engine. LIVE OFF.
+'''Cryptoalpha v6/v7 live-capable engine.
 Fixes: no Futures REST exchangeInfo dependency, fewer long-lived sockets, Binance-compatible keepalive, safer reconnects.
 Futures triangular routes are enabled only for contracts explicitly listed in ARB_FUT_TRI_SYMBOLS.
+Live execution is gated by Binance private authentication and supports Spot triangular arbitrage only.
 '''
 import json, logging, os, random, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,8 +28,6 @@ ROUTES=[(a,b,'USDT') for a,b in [('ETH','BTC'),('BNB','BTC'),('SOL','BTC'),('XRP
 SPOT_SYMBOLS=set(a+'USDT' for a in ASSETS)
 for a,b,q in ROUTES: SPOT_SYMBOLS.update((a+q,b+q,a+b))
 SPOT_SYMBOLS=sorted(SPOT_SYMBOLS)
-# Do not call Binance Futures exchangeInfo at boot: Render was receiving HTTP 418.
-# Use only the known USDT-M contracts for basis monitoring. Cross futures are opt-in.
 FUT_SYMBOLS=sorted(a+'USDT' for a in ASSETS)
 FUT_TRI_RAW=os.getenv('ARB_FUT_TRI_SYMBOLS','').strip()
 FUT_TRI_ROUTES=[]
@@ -36,14 +35,11 @@ if FUT_TRI_RAW:
     available=set(x.strip().upper() for x in FUT_TRI_RAW.split(',') if x.strip())
     for a,b,q in ROUTES:
         if {a+q,b+q,a+b}.issubset(available):
-            FUT_TRI_ROUTES.append((a,b,q))
-            FUT_SYMBOLS.extend([a+b,b+q,a+q])
+            FUT_TRI_ROUTES.append((a,b,q)); FUT_SYMBOLS.extend([a+b,b+q,a+q])
 FUT_SYMBOLS=sorted(set(FUT_SYMBOLS))
 
 def shards(xs): return [xs[i:i+SHARD] for i in range(0,len(xs),SHARD)]
-
-def stream_url(base,symbols):
-    return base.rstrip('/')+'/stream?streams='+'/'.join(s.lower()+'@bookTicker' for s in symbols)
+def stream_url(base,symbols): return base.rstrip('/')+'/stream?streams='+'/'.join(s.lower()+'@bookTicker' for s in symbols)
 
 def worker(kind,base,store,idx,symbols,total):
     backoff=1.0
@@ -51,56 +47,45 @@ def worker(kind,base,store,idx,symbols,total):
         opened_at=0.0
         try:
             def on_open(ws):
-                nonlocal opened_at
-                opened_at=time.monotonic()
-                with lock:
-                    state[kind+'_sockets_up']+=1; state['ws_'+kind]=True
+                nonlocal opened_at; opened_at=time.monotonic()
+                with lock: state[kind+'_sockets_up']+=1; state['ws_'+kind]=True
                 log.info('WS CONNECTED | %s shard %d/%d | %d symbols',kind.upper(),idx+1,total,len(symbols))
             def on_message(ws,raw):
                 try:
-                    msg=json.loads(raw); d=msg.get('data',msg); s=d.get('s')
-                    bid=float(d.get('b',0)); ask=float(d.get('a',0)); bq=float(d.get('B',0)); aq=float(d.get('A',0))
+                    msg=json.loads(raw); d=msg.get('data',msg); s=d.get('s'); bid=float(d.get('b',0)); ask=float(d.get('a',0)); bq=float(d.get('B',0)); aq=float(d.get('A',0))
                     if s and bid>0 and ask>=bid and bq>0 and aq>0:
-                        with lock:
-                            store[s]=(bid,ask,bq,aq,time.monotonic()*1000); state[kind+'_updates']+=1
+                        with lock: store[s]=(bid,ask,bq,aq,time.monotonic()*1000); state[kind+'_updates']+=1
                 except Exception as e:
                     with lock: state['errors']+=1; state['last_error']='message: '+str(e)
             def on_error(ws,e):
                 with lock: state['last_error']=f'{kind} websocket: {e}'
             def on_close(ws,code,msg):
                 with lock:
-                    state[kind+'_sockets_up']=max(0,state[kind+'_sockets_up']-1)
-                    state['ws_'+kind]=state[kind+'_sockets_up']>0
+                    state[kind+'_sockets_up']=max(0,state[kind+'_sockets_up']-1); state['ws_'+kind]=state[kind+'_sockets_up']>0
                 log.warning('WS CLOSED | %s shard %d/%d | code=%s msg=%s',kind.upper(),idx+1,total,code,msg)
             app=websocket.WebSocketApp(stream_url(base,symbols),on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close,header=['User-Agent: cryptoalpha-v6'])
-            # Let websocket-client automatically answer Binance server pings.
-            # Disabling client-originated ping prevents false ping/pong timeouts on Render.
             app.run_forever(ping_interval=0,ping_timeout=None,skip_utf8_validation=True)
         except Exception as e:
             with lock: state['errors']+=1; state['last_error']=f'{kind} transport: {e}'
-        stable=bool(opened_at and time.monotonic()-opened_at>=30)
-        backoff=1.0 if stable else min(30.0,backoff*2.0)
-        time.sleep(backoff+random.random()*.5)
+        stable=bool(opened_at and time.monotonic()-opened_at>=30); backoff=1.0 if stable else min(30.0,backoff*2.0); time.sleep(backoff+random.random()*.5)
 
 def start(kind,base,store,groups):
     state[kind+'_sockets']=len(groups)
-    for i,g in enumerate(groups):
-        threading.Thread(target=worker,args=(kind,base,store,i,g,len(groups)),daemon=True).start()
+    for i,g in enumerate(groups): threading.Thread(target=worker,args=(kind,base,store,i,g,len(groups)),daemon=True).start()
 
 def px(store,s):
-    x=store.get(s)
-    return None if not x or time.monotonic()*1000-x[4]>STALE else (x[0]+x[1])/2
+    x=store.get(s); return None if not x or time.monotonic()*1000-x[4]>STALE else (x[0]+x[1])/2
 
 def throttle(k,v,ms):
     n=time.monotonic()*1000; old=seen.get(k)
-    if old and n-old[0]<ms and abs(v-old[1])<.05: return False
+    if old and n-old[0]<ms and abs(v-old[1])<.05:return False
     seen[k]=(n,v); return True
 
 def tri(a,b,q,eq):
     pa,pab,pb=px(spot,a+q),px(spot,a+b),px(spot,b+q)
-    if not all((pa,pab,pb)): return None
+    if not all((pa,pab,pb)):return None
     ratio=pab/pa*pb; g1=(ratio-1)*10000; g2=(1/ratio-1)*10000; gross=max(g1,g2); net=gross-3*(FEE+SLIP)
-    if net<MIN_NET or net>MAX_NET or not throttle('S:'+a+b+q,net,75): return None
+    if net<MIN_NET or net>MAX_NET or not throttle('S:'+a+b+q,net,75):return None
     return {'engine':'SPOT_TRIANGULAR','type':'SPOT_TRIANGULAR','path':f'USDT->{a}->{b}->USDT' if g1>=g2 else f'USDT->{b}->{a}->USDT','symbol':a+b+q,'gross_bps':gross,'net_bps':net,'notional_usdt':min(max(.01,eq*RISK),MAX_NOTIONAL),'paper_only':True}
 
 def basis(s,eq):
@@ -121,15 +106,11 @@ def scan():
     while True:
         try:
             with lock:eq=state['equity']
-            s=[o for a,b,q in ROUTES for o in [tri(a,b,q,eq)] if o]
-            f=[o for sym in FUT_SYMBOLS if sym.endswith('USDT') for o in [basis(sym,eq)] if o]
-            ft=[o for a,b,q in FUT_TRI_ROUTES for o in [ftri(a,b,q,eq)] if o]
+            s=[o for a,b,q in ROUTES for o in [tri(a,b,q,eq)] if o]; f=[o for sym in FUT_SYMBOLS if sym.endswith('USDT') for o in [basis(sym,eq)] if o]; ft=[o for a,b,q in FUT_TRI_ROUTES for o in [ftri(a,b,q,eq)] if o]
             s.sort(key=lambda x:x['net_bps'],reverse=True); f.sort(key=lambda x:x['net_bps'],reverse=True); allx=s+f+ft
             with lock:
                 for o in allx[:MAX_ENTRIES]:
-                    n=min(o['notional_usdt'],max(.01,state['equity']*RISK),MAX_NOTIONAL); pnl=n*o['net_bps']/10000
-                    state['equity']+=pnl; state['peak']=max(state['peak'],state['equity']); state['paper_pnl']+=pnl
-                    state['spot_entries']+=o['engine']=='SPOT_TRIANGULAR'; state['futures_entries']+=o['engine']!='SPOT_TRIANGULAR'; state['wins']+=pnl>=0; state['losses']+=pnl<0
+                    n=min(o['notional_usdt'],max(.01,state['equity']*RISK),MAX_NOTIONAL); pnl=n*o['net_bps']/10000; state['equity']+=pnl; state['peak']=max(state['peak'],state['equity']); state['paper_pnl']+=pnl; state['spot_entries']+=o['engine']=='SPOT_TRIANGULAR'; state['futures_entries']+=o['engine']!='SPOT_TRIANGULAR'; state['wins']+=pnl>=0; state['losses']+=pnl<0
                 state['scans']+=1; state['spot_opportunities']=len(s); state['futures_opportunities']=len(f)+len(ft); state['best_spot']=s[0] if s else None; state['best_futures']=(f+ft)[0] if (f or ft) else None; state['opportunities']=allx[:100]
         except Exception as e:
             with lock: state['errors']+=1; state['last_error']='scan: '+str(e)
@@ -137,20 +118,17 @@ def scan():
 
 def stats():
     with lock:
-        e=state['equity']
-        return {'status':'ok','engine':'cryptoalpha-v6','mode':'PAPER_ONLY','live_execution':False,'starting_equity':START,'equity':round(e,6),'compound_return_pct':round((e/START-1)*100,6),'paper_pnl':round(state['paper_pnl'],6),'spot_entries':state['spot_entries'],'futures_entries':state['futures_entries'],'paper_entries':state['spot_entries']+state['futures_entries'],'spot_opportunities':state['spot_opportunities'],'futures_opportunities':state['futures_opportunities'],'best_spot':state['best_spot'],'best_futures':state['best_futures'],'top_opportunities':state['opportunities'],'wins':state['wins'],'losses':state['losses'],'scans':state['scans'],'errors':state['errors'],'ws_spot':state['ws_spot'],'ws_futures':state['ws_futures'],'spot_sockets':state['spot_sockets'],'spot_sockets_up':state['spot_sockets_up'],'futures_sockets':state['futures_sockets'],'futures_sockets_up':state['futures_sockets_up'],'quote_updates_spot':state['spot_updates'],'quote_updates_futures':state['futures_updates'],'spot_symbols':len(SPOT_SYMBOLS),'futures_symbols':len(FUT_SYMBOLS),'triangular_routes':len(ROUTES),'futures_triangular_routes':len(FUT_TRI_ROUTES),'min_net_bps':MIN_NET,'risk_pct':RISK*100,'last_error':state['last_error'],'uptime_seconds':round(time.time()-state['started'],1),'unsupported_engines':['FUTURES_FUTURES','CEX_CEX','CEX_DEX','DEX_DEX']}
+        e=state['equity']; return {'status':'ok','engine':'cryptoalpha-v6','mode':'PAPER_ONLY','live_execution':False,'starting_equity':START,'equity':round(e,6),'compound_return_pct':round((e/START-1)*100,6),'paper_pnl':round(state['paper_pnl'],6),'spot_entries':state['spot_entries'],'futures_entries':state['futures_entries'],'paper_entries':state['spot_entries']+state['futures_entries'],'spot_opportunities':state['spot_opportunities'],'futures_opportunities':state['futures_opportunities'],'best_spot':state['best_spot'],'best_futures':state['best_futures'],'top_opportunities':state['opportunities'],'wins':state['wins'],'losses':state['losses'],'scans':state['scans'],'errors':state['errors'],'ws_spot':state['ws_spot'],'ws_futures':state['ws_futures'],'spot_sockets':state['spot_sockets'],'spot_sockets_up':state['spot_sockets_up'],'futures_sockets':state['futures_sockets'],'futures_sockets_up':state['futures_sockets_up'],'quote_updates_spot':state['spot_updates'],'quote_updates_futures':state['futures_updates'],'spot_symbols':len(SPOT_SYMBOLS),'futures_symbols':len(FUT_SYMBOLS),'triangular_routes':len(ROUTES),'futures_triangular_routes':len(FUT_TRI_ROUTES),'min_net_bps':MIN_NET,'risk_pct':RISK*100,'last_error':state['last_error'],'uptime_seconds':round(time.time()-state['started'],1),'unsupported_engines':['FUTURES_FUTURES','CEX_CEX','CEX_DEX','DEX_DEX']}
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/stats.json'):
             body=json.dumps(stats()).encode(); self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body); return
-        body=b'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cryptoalpha</title><body style="font:16px system-ui;max-width:900px;margin:30px auto"><h1>Cryptoalpha v6</h1><p>PAPER ONLY - LIVE OFF</p><pre id="x">loading...</pre><script>async function u(){x.textContent=JSON.stringify(await (await fetch('/stats.json?'+Date.now(),{cache:'no-store'})).json(),null,2)}u();setInterval(u,1000)</script></body>'''; self.send_response(200); self.send_header('Content-Type','text/html'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+        body=b'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cryptoalpha</title><body style="font:16px system-ui;max-width:900px;margin:30px auto"><h1>Cryptoalpha v7</h1><p>LIVE-CAPABLE | Binance auth-gated | Spot triangular execution only</p><pre id="x">loading...</pre><script>async function u(){x.textContent=JSON.stringify(await (await fetch('/stats.json?'+Date.now(),{cache:'no-store'})).json(),null,2)}u();setInterval(u,1000)</script></body>'''
+        self.send_response(200); self.send_header('Content-Type','text/html'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self,*args): pass
 
 def main():
-    start('spot','wss://stream.binance.com:9443',spot,shards(SPOT_SYMBOLS))
-    start('futures','wss://fstream.binance.com',fut,shards(FUT_SYMBOLS))
-    threading.Thread(target=scan,daemon=True).start()
-    port=int(os.getenv('PORT','10000')); ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
+    start('spot','wss://stream.binance.com:9443',spot,shards(SPOT_SYMBOLS)); start('futures','wss://fstream.binance.com',fut,shards(FUT_SYMBOLS)); threading.Thread(target=scan,daemon=True).start(); port=int(os.getenv('PORT','10000')); ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
 
 if __name__=='__main__': main()
