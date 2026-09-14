@@ -41,6 +41,8 @@ services:
         value: "3"
       - key: BASE_RISK_PCT
         value: "0.005"
+      - key: ARB_RISK_PCT
+        value: "0.01"
       - key: SL_PCT
         value: "0.01"
       - key: TP_PCT
