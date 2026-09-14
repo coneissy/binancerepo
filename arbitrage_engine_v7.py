@@ -94,12 +94,14 @@ def stats_v7():
     out=_original_stats(); out["engine"]="cryptoalpha-v7"; out["live_execution"]=enabled(); out["live_mode_configured"]=_live_configured(); out["live_supported_engine"]="SPOT_TRIANGULAR"; out["live_cooldown_ms"]=LIVE_COOLDOWN_MS
     out["configured_balance_usdt"]=float(os.getenv("SIM_START_EQUITY","30")); out["configured_risk_pct"]=v6.RISK*100
     out["configured_risk_budget_usdt"]=round(float(os.getenv("LIVE_STARTING_BALANCE_USDT","30"))*v6.RISK,8)
-    out["configured_live_notional_cap_usdt"]=round(min(max(0,float(os.getenv("MAX_LIVE_NOTIONAL_USDT",str(out["configured_risk_budget_usdt"])))),out["configured_risk_budget_usdt"]),8)
+    static_cap=float(os.getenv("MAX_LIVE_NOTIONAL_USDT","0"))
+    out["configured_live_notional_cap_usdt"]=round(max(0.0,static_cap),8)
+    out["live_sizing_mode"]="BINANCE_FREE_USDT_X_RISK_PCT" if static_cap<=0 else "MIN(BINANCE_FREE_USDT_X_RISK_PCT,STATIC_CAP)"
     out["configured_min_net_bps"]=v6.MIN_NET; out["live_circuit_breaker"]=circuit_status(); out["binance_auth"]=auth_status()
     with v6.lock:
         out["near_misses"]=list(v6.state.get("near_misses",[]))[-50:]; out["rejection_counts"]=dict(v6.state.get("rejection_counts",{})); out["error_log"]=list(v6.state.get("error_log",[]))[-20:]; out["diagnostic_scans"]=v6.state.get("diagnostic_scans",0)
     out["diagnostic_model"]={"triangular_cost_bps":3*(v6.FEE+v6.SLIP),"basis_cost_bps":2*(v6.FEE+v6.SLIP)+v6.FUND,"min_net_bps":v6.MIN_NET,"max_net_bps":v6.MAX_NET,"stale_ms":v6.STALE}
-    out["live_note"]="Only SPOT_TRIANGULAR is live-capable. Basis/futures opportunities remain diagnostics until a separate hedged executor exists."
+    out["live_note"]="Only SPOT_TRIANGULAR is live-capable. Basis/futures opportunities remain diagnostics until a separate hedged executor exists. Live notional is derived from Binance free USDT and the configured risk percentage."
     return out
 
 v6.stats=stats_v7; v6.scan=live_scan
