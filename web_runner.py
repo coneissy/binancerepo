@@ -1,5 +1,5 @@
-"""Render entrypoint for Cryptoalpha Spot + Futures Triangular v4."""
-from arbitrage_engine_v4 import main
+"""Render entrypoint for Cryptoalpha robust paper engine v5."""
+from arbitrage_engine_v5 import main
 
 if __name__ == "__main__":
     main()
