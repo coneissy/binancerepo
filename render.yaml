@@ -24,7 +24,9 @@ services:
       - key: ARB_FEE_BPS
         value: "4"
       - key: ARB_SLIPPAGE_BPS
-        value: "1.5"
+        value: "2"
+      - key: ARB_FUNDING_BUFFER_BPS
+        value: "1"
       - key: ARB_STALE_MS
         value: "750"
       - key: ARB_SCAN_INTERVAL
