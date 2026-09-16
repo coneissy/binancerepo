@@ -18,6 +18,7 @@ jobs:
       BINANCE_BASE_URL: https://demo-fapi.binance.com
       DRY_RUN: true
       LIVE_TRADING: false
+      PYTHONPATH: .
 
     steps:
       - name: Checkout
