@@ -42,8 +42,12 @@ jobs:
       - name: Check required bot secrets are not committed
         shell: bash
         run: |
-          if grep -RniE '(^|[^A-Za-z])(BINANCE_API_KEY|BINANCE_API_SECRET|TELEGRAM_BOT_TOKEN)[[:space:]]*=[[:space:]]*["'"'][^$]' . \
-            --exclude-dir=.git --exclude='*.md' --exclude='ci.yml' --exclude='.env.example'; then
+          set -euo pipefail
+          # Scan tracked files only. Ignore documentation, CI itself, and the
+          # intentionally-placeholder .env.example. Match quoted literal values
+          # only; os.getenv()/getenv() references are not secrets.
+          if git grep -nIE '(^|[^A-Za-z_])(BINANCE_API_KEY|BINANCE_API_SECRET|TELEGRAM_BOT_TOKEN)[[:space:]]*=[[:space:]]*["'"'][^"'"'[:space:]]+["'"']' -- \
+            ':!*.md' ':!.env.example' ':!.github/workflows/ci.yml'; then
             echo 'Possible hard-coded secret detected. Use GitHub Actions secrets/environment variables.'
             exit 1
           fi
