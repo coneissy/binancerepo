@@ -1,12 +1,13 @@
 """Dragon canonical market-data core.
 
-This module replaces the legacy v5/v6 engines. It owns Binance WebSocket
-market data, shared state, configuration, and canonical cost math.
+Market data/state/configuration live here. Arbitrage mathematics lives only in
+pricing.py; this module intentionally does not duplicate pricing formulas.
 Execution/diagnostics are layered on top by arbitrage_engine_v7.py.
 """
 import json, logging, os, random, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
+import pricing
 
 START = float(os.getenv("SIM_START_EQUITY", "10"))
 RISK = min(0.01, max(0.0005, float(os.getenv("ARB_RISK_PCT", "0.005"))))
@@ -51,16 +52,6 @@ if FUT_TRI_RAW:
             FUT_TRI_ROUTES.append((a, b, q))
             FUT_SYMBOLS.extend([a + b, b + q, a + q])
 FUT_SYMBOLS = sorted(set(FUT_SYMBOLS))
-
-def cost_bps(legs, funding=False):
-    """Single canonical round-trip cost model."""
-    return legs * (FEE + SLIP) + (FUND if funding else 0.0)
-
-def net_bps(gross_bps, legs, funding=False):
-    return float(gross_bps) - cost_bps(legs, funding)
-
-def target_notional_usdt(equity):
-    return min(max(0.01, float(equity) * RISK), MAX_NOTIONAL)
 
 def shards(xs):
     return [xs[i:i + SHARD] for i in range(0, len(xs), SHARD)]
@@ -137,7 +128,7 @@ def stats():
             "futures_sockets_up":state["futures_sockets_up"], "quote_updates_spot":state["spot_updates"], "quote_updates_futures":state["futures_updates"],
             "spot_symbols":len(SPOT_SYMBOLS), "futures_symbols":len(FUT_SYMBOLS), "triangular_routes":len(ROUTES),
             "futures_triangular_routes":len(FUT_TRI_ROUTES), "min_net_bps":MIN_NET, "risk_pct":RISK*100,
-            "cost_model":{"basis_2_leg_bps":cost_bps(2, True), "spot_triangle_3_leg_bps":cost_bps(3, False), "futures_triangle_3_leg_bps":cost_bps(3, True)},
+            "cost_model":{"basis_2_leg_bps":pricing.cost_bps(2,FEE,SLIP,FUND), "spot_triangle_3_leg_bps":pricing.cost_bps(3,FEE,SLIP,0), "futures_triangle_3_leg_bps":pricing.cost_bps(3,FEE,SLIP,FUND)},
             "last_error":state["last_error"], "uptime_seconds":round(time.time()-state["started"],1),
             "unsupported_engines":["FUTURES_FUTURES","CEX_CEX","CEX_DEX","DEX_DEX"]
         }
