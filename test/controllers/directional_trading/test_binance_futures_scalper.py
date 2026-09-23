@@ -33,7 +33,7 @@ class TestBinanceFuturesScalper(IsolatedAsyncioWrapperTestCase):
     def test_defaults_are_scalping_safe(self):
         self.assertEqual(self.config.connector_name, "binance_perpetual")
         self.assertEqual(self.config.interval, "1m")
-        self.assertEqual(self.config.leverage, 3)
+        self.assertEqual(self.config.leverage, 15)
         self.assertEqual(self.config.stop_loss, Decimal("0.004"))
         self.assertEqual(self.config.take_profit, Decimal("0.006"))
         self.assertEqual(self.config.time_limit, 900)
