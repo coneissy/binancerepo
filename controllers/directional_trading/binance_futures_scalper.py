@@ -44,7 +44,7 @@ class BinanceFuturesScalperConfig(DirectionalTradingControllerConfigBase):
         },
     )
 
-    # Scalping defaults: low leverage, tight barriers, and short holding time.\n    leverage: int = Field(default=3, ge=1, le=20)\n    stop_loss: Decimal = Field(default=Decimal("0.004"), gt=0)\n    take_profit: Decimal = Field(default=Decimal("0.006"), gt=0)\n    time_limit: int = Field(default=900, gt=0)\n\n    fast_ema: int = Field(default=9, gt=1)
+    # Scalping defaults: low leverage, tight barriers, and short holding time.\n    leverage: int = Field(default=15, ge=1, le=20)\n    stop_loss: Decimal = Field(default=Decimal("0.004"), gt=0)\n    take_profit: Decimal = Field(default=Decimal("0.006"), gt=0)\n    time_limit: int = Field(default=900, gt=0)\n\n    fast_ema: int = Field(default=9, gt=1)
     slow_ema: int = Field(default=21, gt=2)
     rsi_length: int = Field(default=14, gt=2)
     macd_fast: int = Field(default=12, gt=1)
