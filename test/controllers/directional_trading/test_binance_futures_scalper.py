@@ -20,7 +20,7 @@ class TestBinanceFuturesScalper(IsolatedAsyncioWrapperTestCase):
             connector_name="binance_perpetual",
             trading_pair="BTC-USDT",
             total_amount_quote=Decimal("100"),
-            leverage=3,
+            leverage=15,
         )
         self.provider = MagicMock(spec=MarketDataProvider)
         self.actions_queue = AsyncMock()
@@ -53,4 +53,4 @@ class TestBinanceFuturesScalper(IsolatedAsyncioWrapperTestCase):
 
     def test_inherits_directional_executor_pipeline(self):
         self.assertIsInstance(self.controller, DirectionalTradingControllerBase)
-        self.assertEqual(self.controller.max_records, 65)
+        self.assertEqual(self.controller.max_records, 56)
