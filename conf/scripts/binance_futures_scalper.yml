@@ -1,0 +1,8 @@
+markets: {}
+candles_config: []
+controllers_config:
+  - binance_futures_scalper.yml
+config_update_interval: 10
+script_file_name: v2_with_controllers.py
+max_global_drawdown_quote: null
+max_controller_drawdown_quote: null
