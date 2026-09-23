@@ -1,0 +1,35 @@
+name: Mirror Hummingbot Upstream
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Hummingbot upstream
+        run: git clone --depth 1 --branch master https://github.com/hummingbot/hummingbot.git /tmp/hummingbot
+
+      - name: Replace target contents exactly
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/hummingbot/. .
+          rm -f .github/workflows/mirror-hummingbot.yml
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Replace repository with Hummingbot upstream" || exit 0
+          git push origin HEAD:main
