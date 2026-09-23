@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: binance-futures-scalper
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: bash -lc "/home/hummingbot/render/start_scalper.sh"
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: HBOT_PASSWORD
+        sync: false
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
