@@ -23,13 +23,22 @@ jobs:
       - name: Replace target contents exactly
         run: |
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          cp -a /tmp/hummingbot/. .
+          rsync -a --delete --exclude='.git' /tmp/hummingbot/ ./
           rm -f .github/workflows/mirror-hummingbot.yml
+
+      - name: Verify upstream tree is present
+        run: |
+          test -f README.md
+          test -f Dockerfile
+          test -d hummingbot
+          test -d controllers
+          test -d test
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Replace repository with Hummingbot upstream" || exit 0
+          git status --short
+          git commit -m "Replace repository with Hummingbot upstream"
           git push origin HEAD:main
