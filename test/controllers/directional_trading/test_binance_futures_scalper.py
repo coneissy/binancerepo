@@ -53,4 +53,4 @@ class TestBinanceFuturesScalper(IsolatedAsyncioWrapperTestCase):
 
     def test_inherits_directional_executor_pipeline(self):
         self.assertIsInstance(self.controller, DirectionalTradingControllerBase)
-        self.assertEqual(self.controller.max_records, 60)
+        self.assertEqual(self.controller.max_records, 65)
