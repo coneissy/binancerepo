@@ -19,6 +19,9 @@ COPY bin/ bin/
 COPY hummingbot/ hummingbot/
 COPY scripts/ scripts/
 COPY controllers/ controllers/
+COPY conf/controllers/ conf/controllers/
+COPY conf/scripts/ conf/scripts/
+COPY render/ render/
 COPY scripts/ scripts-copy/
 COPY setup.py .
 COPY LICENSE .
